@@ -211,7 +211,7 @@ function EventCard({ item }: { item: FeedItem }) {
         </CardContent>
       </Card>
     );
-  } catch (_error) {
+  } catch (_) {
     // Handle parsing errors or missing properties
     return (
       <Card className="overflow-hidden border border-neutral-800 bg-black shadow-lg">
