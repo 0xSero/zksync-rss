@@ -68,10 +68,10 @@ export const monitorEventsInRange = async (
               chainId
             });
           });
-        } catch (innerErr: any) {
+        } catch (err: unknown) {
           const errorMessage = `
             🚨 ERROR processing event ${eventName} on contract ${address} from block ${fromBlock} to ${toBlock}
-            Error: ${innerErr.message}
+            Error: ${err instanceof Error ? err.message : String(err)}
           `;
           console.error(errorMessage);
           throw new Error(errorMessage);
@@ -84,8 +84,8 @@ export const monitorEventsInRange = async (
       console.log(`✅ Successfully processed ${collectedEvents.length} events between blocks ${fromBlock} and ${toBlock}`);
     }
     return collectedEvents;
-  } catch (err: any) {
-    console.error(`🚨 FATAL ERROR processing blocks ${fromBlock}-${toBlock}: ${err.message}`, err.stack);
+  } catch (err: unknown) {
+    console.error(`🚨 FATAL ERROR processing blocks ${fromBlock}-${toBlock}: ${err instanceof Error ? err.message : String(err)}`, err instanceof Error ? err.stack : undefined);
     throw err;
   } finally {
     console.timeEnd(`monitor-range-${fromBlock}-${toBlock}`);
