@@ -107,7 +107,7 @@ async function processBlockRangeForNetwork(
 
   let foundEvents = false;
   // Process blocks in batches rather than one-by-one
-  for (let batchStart = startBlock; batchStart <= endBlock;) {
+  for (let batchStart = startBlock; batchStart <= endBlock; batchStart += batchSize) {
     const batchEnd = Math.min(batchStart + batchSize - 1, endBlock);
     console.log(`Processing ${config.networkName} batch: ${batchStart} to ${batchEnd}`);
     batchStart = batchEnd;
