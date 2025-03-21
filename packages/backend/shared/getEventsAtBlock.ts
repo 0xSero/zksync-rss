@@ -22,11 +22,10 @@ export const monitorEventsAtBlock = async (
     const allEventPromises = Object.entries(contractsConfig).flatMap(([address, events]) => {
       console.log(`🔍 Checking contract ${address} for events: ${events.join(', ')}`);
       const contract = new ethers.Contract(address, UnifiedMinimalABI, provider);
-      
+
       const eventLogsPromises = events.map(eventName =>
         contract.queryFilter(eventName, blocknumber, blocknumber)
           .then(eventLogs => {
-            console.log(`✅ Found ${eventLogs.length} ${eventName} events for ${address}`);
             return eventLogs.map(log => {
               const eventFragment = contract.interface.getEvent(eventName);
               if (!eventFragment) {
@@ -78,13 +77,13 @@ export const monitorEventsAtBlock = async (
     });
 
     const results = await Promise.all(allEventPromises); // Changed from allSettled to all
-    
+
     // Process results directly into organized events
     const organizedEvents = results.flatMap((result) => {
       if (!result) {
         throw new Error(`🚨 Received null result when processing events at block ${blocknumber}`);
       }
-      
+
       return result.filter(e => e != undefined).map(event => {
         if (!event?.interface) {
           throw new Error(`🚨 Invalid event data at block ${blocknumber}`);
@@ -93,10 +92,10 @@ export const monitorEventsAtBlock = async (
           '0x8f7a9912416e8adc4d9c21fae1415d3318a11897'  // Protocol Upgrade Handler
         ];
         const isEthereum = ETHEREUM_ADDRESSES.includes(event.address.toLowerCase());
-        const link = isEthereum ? 
+        const link = isEthereum ?
           `https://etherscan.io/tx/${event.txhash}` :
           `https://explorer.zksync.io/tx/${event.txhash}`;
-          const networkName = isEthereum ? 'Ethereum Mainnet' : 'ZKSync Era';        
+          const networkName = isEthereum ? 'Ethereum Mainnet' : 'ZKSync Era';
           const chainId = isEthereum ? '1' : '324';
         return {
           interface: event.interface,
@@ -111,7 +110,7 @@ export const monitorEventsAtBlock = async (
           args: event.args,
           topics: [getCategory(event.address)],
           timestamp: blockTimestamp.toISOString(),
-          proposalLink: event.args.proposalId ? 
+          proposalLink: event.args.proposalId ?
             `https://vote.zknation.io/dao/proposal/${event.args.proposalId}?govId=eip155:${
               event.address.toLowerCase() in EventsMapping["Ethereum Mainnet"] ? '1' : '324'
             }:${event.address}` : '',
