@@ -12,27 +12,30 @@ function truncateAddress(address: string): string {
   return `${address.substring(0, 6)}...${address.substring(address.length - 4)}`;
 }
 
-function truncateEventData(eventData: any): any {
+type EventDataType = Record<string, unknown>;
+
+function truncateEventData(eventData: EventDataType): EventDataType {
   if (!eventData) return eventData;
 
   const result = JSON.parse(JSON.stringify(eventData));
 
-  function processValue(obj: any): any {
+  function processValue(obj: unknown): unknown {
     if (typeof obj !== 'object' || obj === null) return obj;
     if (Array.isArray(obj)) return obj.map(item => processValue(item));
 
-    for (const key in obj) {
-      if (typeof obj[key] === 'string' && obj[key].startsWith('0x') && obj[key].length > 100) {
-        obj[key] = `${obj[key].substring(0, 10)}...${obj[key].substring(obj[key].length - 8)}`;
-      } else if (typeof obj[key] === 'object' && obj[key] !== null) {
-        obj[key] = processValue(obj[key]);
+    const objRecord = obj as Record<string, unknown>;
+    for (const key in objRecord) {
+      if (typeof objRecord[key] === 'string' && objRecord[key].toString().startsWith('0x') && objRecord[key].toString().length > 100) {
+        objRecord[key] = `${objRecord[key].toString().substring(0, 10)}...${objRecord[key].toString().substring(objRecord[key].toString().length - 8)}`;
+      } else if (typeof objRecord[key] === 'object' && objRecord[key] !== null) {
+        objRecord[key] = processValue(objRecord[key]);
       }
     }
 
-    return obj;
+    return objRecord;
   }
 
-  return processValue(result);
+  return processValue(result) as EventDataType;
 }
 
 function formatTitle(title: string, contractAddress: string, network: string): string {
@@ -69,7 +72,7 @@ interface GovernanceInfo {
 }
 
 interface EventData {
-  [key: string]: any;
+  [key: string]: unknown;
 }
 
 interface EventDescription {
@@ -208,7 +211,7 @@ function EventCard({ item }: { item: FeedItem }) {
         </CardContent>
       </Card>
     );
-  } catch (error) {
+  } catch (_error) {
     // Handle parsing errors or missing properties
     return (
       <Card className="overflow-hidden border border-neutral-800 bg-black shadow-lg">
