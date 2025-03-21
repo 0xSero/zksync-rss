@@ -110,7 +110,6 @@ async function processBlockRangeForNetwork(
   for (let batchStart = startBlock; batchStart <= endBlock; batchStart += batchSize) {
     const batchEnd = Math.min(batchStart + batchSize - 1, endBlock);
     console.log(`Processing ${config.networkName} batch: ${batchStart} to ${batchEnd}`);
-    batchStart = batchEnd;
 
     try {
       // Use the new batched query function
@@ -141,6 +140,7 @@ async function processBlockRangeForNetwork(
         hasError: false,
         lastError: undefined
       });
+      batchStart = batchEnd;
     } catch (error) {
       console.error(`Error processing ${config.networkName} blocks ${batchStart} to ${batchEnd}:`, error);
       record.errors.push({
