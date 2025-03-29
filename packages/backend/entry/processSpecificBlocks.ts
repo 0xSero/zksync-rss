@@ -1,83 +1,52 @@
 import path from 'path';
-import { addEventToRSS, updateRSSFeed } from "~/rss/utils";
-import {
-  convertBigIntToString,
-  monitorEventsAtBlock,
-  ethereumConfig,
-  zkSyncConfig,
-  NetworkConfig,
-} from "~/shared";
+import { addEventToRSS, updateRSSFeed } from "../rss/utils";
+import { ethereumConfig, zkSyncConfig } from "../shared/constants";
 import dotenv from 'dotenv';
+import { convertBigIntToString } from "../shared/utils";
+import { monitorEventsAtBlock } from "../shared/getEventsAtBlock";
+import type { NetworkConfig } from "../shared/types";
 
 // Configuration
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
 async function processSpecificBlocks(networkName: string, blockNumbers: number[]) {
-  try {
-    console.log(`Processing specific blocks for ${networkName}: ${blockNumbers.join(', ')}`);
-    
-    // Get network configuration
-    let config: NetworkConfig;
-    if (networkName.toLowerCase() === 'ethereum') {
-      config = ethereumConfig;
-    } else if (networkName.toLowerCase() === 'zksync') {
-      config = zkSyncConfig;
-    } else {
-      throw new Error(`Unsupported network: ${networkName}`);
-    }
+  const config = networkName === 'ethereum' ? ethereumConfig : zkSyncConfig;
+  const provider = config.provider;
+  let foundEvents = false;
 
-    let foundEvents = false;
+  for (const blockNumber of blockNumbers) {
+    const block = await provider.getBlock(blockNumber);
+    if (!block) continue;
 
-    // Process each block
-    for (const blockNumber of blockNumbers) {
-      console.log(`Processing block ${blockNumber} on ${networkName}`);
-      
-      try {
-        const events = await monitorEventsAtBlock(
+    const events = await monitorEventsAtBlock(
+      blockNumber,
+      provider,
+      config.eventsMapping
+    );
+
+    if (events.length > 0) {
+      foundEvents = true;
+      for (const event of events) {
+        await addEventToRSS(
+          event.address,
+          event.eventName,
+          event.topics,
+          event.title,
+          event.link,
+          networkName === 'ethereum' ? 'Ethereum Mainnet' : networkName,
+          Number(event.chainId),
           blockNumber,
-          config.provider,
-          config.eventsMapping
+          config.governanceName,
+          event.proposalLink || null,
+          String(block.timestamp),
+          convertBigIntToString(event.args)
         );
-
-        if (events.length > 0) {
-          foundEvents = true;
-          events.forEach((event) => {
-            addEventToRSS(
-              event.address,
-              event.eventName,
-              event.topics,
-              event.title,
-              event.link,
-              config.networkName,
-              config.chainId,
-              event.blocknumber,
-              config.governanceName,
-              event.proposalLink,
-              event.timestamp,
-              convertBigIntToString(event.args)
-            );
-          });
-          console.log(`Found ${events.length} events at block ${blockNumber}`);
-        } else {
-          console.log(`No events found at block ${blockNumber}`);
-        }
-      } catch (error) {
-        console.error(`Error processing block ${blockNumber}:`, error);
-        // Continue processing other blocks even if one fails
       }
     }
+  }
 
-    // Update RSS feed if any events were found
-    if (foundEvents) {
-      const updated = await updateRSSFeed();
-      console.log(updated ? 'RSS feed updated' : 'RSS feed unchanged');
-    }
-
-    console.log('Successfully processed all specified blocks');
-
-  } catch (error) {
-    console.error('Failed to process blocks:', error);
-    process.exit(1);
+  if (foundEvents) {
+    await updateRSSFeed();
   }
 }
 
@@ -98,12 +67,10 @@ if (require.main === module) {
   const blocks = process.argv.slice(3).map(Number);
 
   if (!network || blocks.length === 0) {
-    console.error('Usage: npm run process-specific-blocks <network> <blockNumber1> <blockNumber2> ...');
-    console.error('Example: npm run process-specific-blocks ethereum 17791410 17791411 17791412');
-    process.exit(1);
+    throw new Error('Usage: npm run process-specific-blocks <network> <blockNumber1> <blockNumber2> ...');
   }
 
   processSpecificBlocks(network, blocks);
 }
 
-export { processSpecificBlocks }; 
+export { processSpecificBlocks };

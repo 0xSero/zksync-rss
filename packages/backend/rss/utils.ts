@@ -45,6 +45,7 @@ class RSSFeedManager {
   private static instance: RSSFeedManager;
   private initialized = false;
   private seenGuids = new Set<string>();
+  private items: ItemOptions[] = [];  // Track items separately for better sorting
 
   private constructor() {
     this.feed = new RSS(CONFIG.feed);
@@ -68,7 +69,7 @@ class RSSFeedManager {
     try {
       const storage = new Storage();
       const bucket = storage.bucket(GCS_BUCKET_NAME);
-      
+
       // Get current feed
       const file = bucket.file(GCS_RSS_PATH);
       if ((await file.exists())[0]) {
@@ -84,7 +85,7 @@ class RSSFeedManager {
         const result = await new Parser().parseString(content.toString());
         result.items?.forEach(item => this.addItemToFeed(item));
       }
-      
+
       console.log(`Loaded ${this.seenGuids.size} unique items`);
     } catch (error) {
       console.error('Error downloading feed:', error);
@@ -94,9 +95,28 @@ class RSSFeedManager {
 
   private addItemToFeed(item: ParsedItem) {
     const guid = item.guid || item.id;
-    if (guid && !this.seenGuids.has(guid)) {
-      this.seenGuids.add(guid);
-      this.feed.item({
+    if (!guid) return;
+
+    // Parse the description to get network name and other details
+    let eventDetails;
+    try {
+      const description = JSON.parse(item.content || item.contentSnippet || '{}');
+      eventDetails = description.eventDetails;
+    } catch (e) {
+      console.error('Failed to parse event details:', e);
+      return;
+    }
+
+    // Normalize GUID components
+    const normalizedNetworkName = (eventDetails?.network || '').toLowerCase().replace(/\s+/g, '');
+    const normalizedTitle = (item.title || '').toLowerCase().replace(/\s+/g, '');
+    const normalizedLink = (item.link || '').toLowerCase();
+    const guidInput = `${normalizedNetworkName}-${eventDetails?.chainId || ''}-${normalizedTitle}-${eventDetails?.block || ''}-${normalizedLink}`;
+    const normalizedGuid = ethers.keccak256(ethers.toUtf8Bytes(guidInput));
+
+    if (!this.seenGuids.has(normalizedGuid)) {
+      this.seenGuids.add(normalizedGuid);
+      const newItem = {
         title: item.title || '',
         description: item.content || item.contentSnippet || '',
         url: item.link || '',
@@ -104,7 +124,40 @@ class RSSFeedManager {
         categories: item.categories || [],
         author: item.creator || item.author || '',
         date: new Date(item.isoDate || item.pubDate || new Date())
+      };
+
+      // Get timestamp for sorting
+      const timestamp = newItem.date.getTime();
+
+      // Insert item in correct position to maintain sorted order
+      const insertIndex = this.items.findIndex(existingItem => {
+        const existingTimestamp = new Date(existingItem.date).getTime();
+        return existingTimestamp < timestamp;
       });
+
+      if (insertIndex === -1) {
+        this.items.push(newItem);
+      } else {
+        this.items.splice(insertIndex, 0, newItem);
+      }
+
+      // Keep only the newest ARCHIVE_ITEM_THRESHOLD items in main feed
+      if (this.items.length > ARCHIVE_ITEM_THRESHOLD) {
+        const itemsToArchive = this.items.slice(ARCHIVE_ITEM_THRESHOLD);
+        this.items = this.items.slice(0, ARCHIVE_ITEM_THRESHOLD);
+
+        // Create archive feed for older items
+        const archiveFeed = new RSS(CONFIG.feed);
+        itemsToArchive.forEach(item => archiveFeed.item(item));
+
+        // Upload archive asynchronously
+        uploadToGCS(
+          GCS_BUCKET_NAME,
+          CONFIG.filePaths.output,
+          `${GCS_ARCHIVE_PATH}/archive-${Date.now()}.xml`,
+          archiveFeed.xml()
+        ).catch(() => {});
+      }
     }
   }
 
@@ -122,17 +175,21 @@ class RSSFeedManager {
     timestamp: string,
     eventArgs: Record<string, unknown>
   }) {
-    const guid = ethers.keccak256(ethers.toUtf8Bytes(event.title + event.block + event.link));
-    
-    if (this.seenGuids.has(guid)) {
-      console.log(`Skipping duplicate event: ${event.title}`);
-      return;
-    }
+    const normalizedNetworkName = event.networkName.toLowerCase().replace(/\s+/g, '');
+    const normalizedTitle = event.title.toLowerCase().replace(/\s+/g, '');
+    const normalizedLink = event.link.toLowerCase();
+    const guidInput = `${normalizedNetworkName}-${event.chainId}-${normalizedTitle}-${event.block}-${normalizedLink}`;
+    const guid = ethers.keccak256(ethers.toUtf8Bytes(guidInput));
 
-    console.log(`Adding new event: ${event.title}`);
-    this.seenGuids.add(guid);
-    
-    this.feed.item({
+    if (this.seenGuids.has(guid)) return;
+
+    const unixTimestamp = Number(event.timestamp);
+    if (isNaN(unixTimestamp)) return;
+
+    const date = new Date(unixTimestamp * 1000);
+    if (isNaN(date.getTime())) return;
+
+    const newItem = {
       title: event.title,
       url: event.link,
       description: JSON.stringify({
@@ -140,7 +197,7 @@ class RSSFeedManager {
           network: event.networkName,
           chainId: event.chainId,
           block: event.block,
-          timestamp: new Date(event.timestamp).toLocaleString()
+          timestamp: date.toLocaleString()
         },
         governanceInfo: {
           governanceBody: event.govBody,
@@ -152,61 +209,77 @@ class RSSFeedManager {
       }),
       author: event.govBody,
       categories: event.topics,
-      date: new Date(event.timestamp),
+      date: date,
       guid,
+    };
+
+    const itemTimestamp = date.getTime();
+    const insertIndex = this.items.findIndex(existingItem => {
+      const existingTimestamp = new Date(existingItem.date).getTime();
+      return existingTimestamp < itemTimestamp;
     });
+
+    if (insertIndex === -1) {
+      this.items.push(newItem);
+    } else {
+      this.items.splice(insertIndex, 0, newItem);
+    }
+
+    if (this.items.length > ARCHIVE_ITEM_THRESHOLD) {
+      const itemsToArchive = this.items.slice(ARCHIVE_ITEM_THRESHOLD);
+      this.items = this.items.slice(0, ARCHIVE_ITEM_THRESHOLD);
+
+      const archiveFeed = new RSS(CONFIG.feed);
+      itemsToArchive.forEach(item => archiveFeed.item(item));
+
+      uploadToGCS(
+        GCS_BUCKET_NAME,
+        CONFIG.filePaths.output,
+        `${GCS_ARCHIVE_PATH}/archive-${Date.now()}.xml`,
+        archiveFeed.xml()
+      ).catch(() => {});
+    }
   }
 
   async generate(): Promise<RSS> {
-    // Create new feed
     const sortedFeed = new RSS(CONFIG.feed);
-    
-    // Get all items and sort by date (newest first)
-    const items = (this.feed as RSSWithItems).items
-      .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
-    
-    // Add sorted items to feed
-    items.forEach(item => sortedFeed.item(item));
-    
+    this.items.forEach(item => sortedFeed.item(item));
     return sortedFeed;
   }
 
   async upload(feed: RSS): Promise<boolean> {
     try {
-        const rssContent = feed.xml();
-        fs.mkdirSync(path.dirname(CONFIG.filePaths.output), { recursive: true });
-        fs.writeFileSync(CONFIG.filePaths.output, rssContent);
-        await uploadToGCS(GCS_BUCKET_NAME, CONFIG.filePaths.output, GCS_RSS_PATH, rssContent);
-        
-        return true;
-    } catch (error) {
-        console.error('Failed to upload RSS feed:', error);
-        return false;
+      const rssContent = feed.xml();
+      fs.mkdirSync(path.dirname(CONFIG.filePaths.output), { recursive: true });
+      fs.writeFileSync(CONFIG.filePaths.output, rssContent);
+      await uploadToGCS(GCS_BUCKET_NAME, CONFIG.filePaths.output, GCS_RSS_PATH, rssContent);
+      return true;
+    } catch {
+      return false;
     }
   }
 
   async generateAndUpload(): Promise<boolean> {
     try {
-        const feed = await this.generate();
-        return await this.upload(feed);
-    } catch (error) {
-        console.error('Failed to generate/upload RSS feed:', error);
-        return false;
+      const feed = await this.generate();
+      return await this.upload(feed);
+    } catch {
+      return false;
     }
   }
 }
 
 export const addEventToRSS = async (
-  address: string, 
-  eventName: string, 
-  topics: string[], 
-  title: string, 
-  link: string, 
-  networkName: string, 
-  chainId: number, 
-  block: number, 
-  govBody: string, 
-  proposalLink: string | null, 
+  address: string,
+  eventName: string,
+  topics: string[],
+  title: string,
+  link: string,
+  networkName: string,
+  chainId: number,
+  block: number,
+  govBody: string,
+  proposalLink: string | null,
   timestamp: string,
   eventArgs: Record<string, unknown>
 ) => {
@@ -221,16 +294,16 @@ export const addEventToRSS = async (
 export const updateRSSFeed = async () => {
   const manager = RSSFeedManager.getInstance();
   await manager.initialize();
-  
+
   const feed = await manager.generate(); // Items are now sorted newest first
   const items = (feed as RSSWithItems).items;
-  
+
   if (items.length > ARCHIVE_ITEM_THRESHOLD) {
     // Keep newest items in main feed
     const itemsToKeep = items.slice(0, ARCHIVE_ITEM_THRESHOLD);
     // Archive older items
     const itemsToArchive = items.slice(ARCHIVE_ITEM_THRESHOLD);
-    
+
     // Create and upload archive of older items
     const archiveFeed = new RSS(CONFIG.feed);
     itemsToArchive.forEach(item => archiveFeed.item(item));
@@ -240,12 +313,12 @@ export const updateRSSFeed = async () => {
       `${GCS_ARCHIVE_PATH}/archive-${Date.now()}.xml`,
       archiveFeed.xml()
     );
-    
+
     // Update main feed with newest items
     const newFeed = new RSS(CONFIG.feed);
     itemsToKeep.forEach(item => newFeed.item(item));
     return await manager.upload(newFeed);
   }
-  
+
   return await manager.upload(feed);
 };
