@@ -216,6 +216,11 @@ class RSSFeedManager {
     const itemTimestamp = date.getTime();
     const insertIndex = this.items.findIndex(existingItem => {
       const existingTimestamp = new Date(existingItem.date).getTime();
+      // If timestamps are equal, use block number as secondary sort key
+      if (existingTimestamp === itemTimestamp) {
+        const existingBlock = JSON.parse(existingItem.description).eventDetails.block;
+        return existingBlock < event.block;
+      }
       return existingTimestamp < itemTimestamp;
     });
 

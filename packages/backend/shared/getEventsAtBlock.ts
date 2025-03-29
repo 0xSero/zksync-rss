@@ -4,7 +4,9 @@ import { UnifiedMinimalABI, EventsMapping, ParsedEvent, getCategory, getGovBodyF
 export const monitorEventsAtBlock = async (
   blocknumber: number,
   provider: ethers.Provider,
-  contractsConfig: { [address: string]: string[] }
+  contractsConfig: { [address: string]: string[] },
+  networkName: string, // Added networkName
+  chainId: number      // Added chainId
 ): Promise<ParsedEvent[]> => {
   try {
     const block = await provider.getBlock(blocknumber);
@@ -13,6 +15,15 @@ export const monitorEventsAtBlock = async (
     }
     if (!block.timestamp) {
       throw new Error(`Block ${blocknumber} has no timestamp`);
+    }
+
+    // Validate timestamp
+    const timestamp = Number(block.timestamp);
+    const now = Math.floor(Date.now() / 1000);
+    const isFutureTimestamp = timestamp > now;
+
+    if (isFutureTimestamp) {
+      console.warn(`Block ${blocknumber} has a future timestamp: ${timestamp} (${new Date(timestamp * 1000).toISOString()}). Using current time instead.`);
     }
 
     const allEventPromises = Object.entries(contractsConfig).flatMap(([address, events]) => {
@@ -74,15 +85,18 @@ export const monitorEventsAtBlock = async (
         if (!event?.interface) {
           throw new Error(`Invalid event data at block ${blocknumber}`);
         }
-        const ETHEREUM_ADDRESSES = [
-          '0x8f7a9912416e8adc4d9c21fae1415d3318a11897'  // Protocol Upgrade Handler
-        ];
-        const isEthereum = ETHEREUM_ADDRESSES.includes(event.address.toLowerCase());
-        const link = isEthereum ?
-          `https://etherscan.io/tx/${event.txhash}` :
-          `https://explorer.zksync.io/tx/${event.txhash}`;
-        const networkName = isEthereum ? 'Ethereum Mainnet' : 'ZKSync Era';
-        const chainId = isEthereum ? '1' : '324';
+
+        // Determine block explorer link based on networkName
+        const blockExplorerBaseUrl = networkName === 'Ethereum Mainnet' ? 'https://etherscan.io' : 'https://explorer.zksync.io';
+        const link = `${blockExplorerBaseUrl}/tx/${event.txhash}`;
+
+        // Use current time if block timestamp is in the future
+        const eventTimestamp = isFutureTimestamp ? now : timestamp;
+
+        // Construct proposal link using the provided chainId
+        const proposalLink = event.args.proposalId ?
+          `https://vote.zknation.io/dao/proposal/${event.args.proposalId}?govId=eip155:${chainId}:${event.address}` : '';
+
         return {
           interface: event.interface,
           rawData: event.rawData,
@@ -95,13 +109,10 @@ export const monitorEventsAtBlock = async (
           address: event.address,
           args: event.args,
           topics: [getCategory(event.address)],
-          timestamp: String(block.timestamp),
-          proposalLink: event.args.proposalId ?
-            `https://vote.zknation.io/dao/proposal/${event.args.proposalId}?govId=eip155:${
-              event.address.toLowerCase() in EventsMapping["Ethereum Mainnet"] ? '1' : '324'
-            }:${event.address}` : '',
-          networkName,
-          chainId,
+          timestamp: String(eventTimestamp),
+          proposalLink,
+          networkName, // Use passed-in networkName
+          chainId: String(chainId), // Use passed-in chainId, converting to string
         };
       });
     });
