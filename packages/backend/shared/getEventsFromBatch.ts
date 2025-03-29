@@ -8,7 +8,9 @@ export const monitorEventsInRange = async (
   fromBlock: number,
   toBlock: number,
   provider: ethers.Provider,
-  contractsConfig: { [address: string]: string[] }
+  contractsConfig: { [address: string]: string[] },
+  networkName: string, // Added networkName
+  chainId: number      // Added chainId
 ): Promise<ParsedEvent[]> => {
   console.time(`monitor-range-${fromBlock}-${toBlock}`);
   const collectedEvents: ParsedEvent[] = [];
@@ -36,16 +38,19 @@ export const monitorEventsInRange = async (
               args[input.name] = decodedData[index];
             });
             // Organize the event as needed
-            const ETHEREUM_ADDRESSES = [
-              "0x8f7a9912416e8adc4d9c21fae1415d3318a11897" // Example: Protocol Upgrade Handler
-            ];
-            const isEthereum = ETHEREUM_ADDRESSES.includes(address.toLowerCase());
-            const link = isEthereum
-              ? `https://etherscan.io/tx/${log.transactionHash}`
-              : `https://explorer.zksync.io/tx/${log.transactionHash}`;
-            const networkName = isEthereum ? "Ethereum Mainnet" : "ZKSync Era";
-            const chainId = isEthereum ? "1" : "324";
-            const blockTimestamp = new Date(log.blockNumber * 1000).toISOString(); // adjust as needed if timestamp is available from elsewhere
+            const blockExplorerBaseUrl = networkName === 'Ethereum Mainnet' ? 'https://etherscan.io' : 'https://explorer.zksync.io';
+            const link = `${blockExplorerBaseUrl}/tx/${log.transactionHash}`;
+
+            // TODO: Fetch actual block timestamp if possible, otherwise estimate or handle appropriately
+            // For now, using a placeholder or potentially inaccurate estimation based on block number
+            // const block = await provider.getBlock(log.blockNumber); // This would be slow in a loop
+            // const blockTimestamp = block ? new Date(block.timestamp * 1000).toISOString() : new Date().toISOString(); // Fallback to current time
+            const blockTimestamp = new Date().toISOString(); // Placeholder: Using current time as timestamp is not reliable from logs alone
+
+            const proposalLink = args.proposalId
+              ? `https://vote.zknation.io/dao/proposal/${args.proposalId}?govId=eip155:${chainId}:${address}`
+              : "";
+
             collectedEvents.push({
               interface: eventFragment,
               rawData: log.data,
@@ -58,14 +63,10 @@ export const monitorEventsInRange = async (
               address,
               args,
               topics: [getCategory(address)],
-              timestamp: blockTimestamp,
-              proposalLink: args.proposalId
-                ? `https://vote.zknation.io/dao/proposal/${args.proposalId}?govId=eip155:${
-                    address.toLowerCase() in EventsMapping["Ethereum Mainnet"] ? "1" : "324"
-                  }:${address}`
-                : "",
-              networkName,
-              chainId
+              timestamp: blockTimestamp, // Using placeholder timestamp
+              proposalLink,
+              networkName, // Use passed-in networkName
+              chainId: String(chainId) // Use passed-in chainId, converting to string
             });
           });
         } catch (err: unknown) {
