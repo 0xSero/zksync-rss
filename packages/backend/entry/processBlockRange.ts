@@ -252,8 +252,8 @@ async function processLatestBlocks() {
           governanceName: "ZKSync Governance",
           pollInterval: 1000
         },
-        58794460,
-        58794464
+        zksyncStartBlock,
+        zksyncCurrentBlock
       )
     ]);
 
