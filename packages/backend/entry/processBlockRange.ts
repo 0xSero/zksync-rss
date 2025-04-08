@@ -113,7 +113,7 @@ async function processBlockRangeForNetwork(
 
     try {
       // Use the new batched query function
-      const events = await monitorEventsInRange(batchStart, batchEnd, config.provider, config.eventsMapping);
+      const events = await monitorEventsInRange(batchStart, batchEnd, config.provider, config.eventsMapping, config.networkName, config.chainId);
       if (events.length > 0) {
         foundEvents = true;
         record.eventsFound += events.length;
@@ -252,8 +252,8 @@ async function processLatestBlocks() {
           governanceName: "ZKSync Governance",
           pollInterval: 1000
         },
-        zksyncStartBlock,
-        zksyncCurrentBlock
+        58794460,
+        58794464
       )
     ]);
 
