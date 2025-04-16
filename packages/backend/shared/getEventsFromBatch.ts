@@ -1,5 +1,5 @@
 import { ethers } from "ethers";
-import { UnifiedMinimalABI, EventsMapping, ParsedEvent, getCategory, getGovBodyFromAddress } from "~/shared";
+import { UnifiedMinimalABI, ParsedEvent, getCategory, getGovBodyFromAddress } from "~/shared";
 
 /**
  * Queries logs for multiple contracts and events over a block range.
@@ -22,30 +22,59 @@ export const monitorEventsInRange = async (
       for (const eventName of events) {
         try {
           const logs = await contract.queryFilter(eventName, fromBlock, toBlock);
-          logs.forEach(log => {
+          
+          // Store a cache of block timestamps to avoid repeated fetches
+          const blockTimestamps: Record<number, number> = {};
+          
+          for (const log of logs) {
             const eventFragment = contract.interface.getEvent(eventName);
             if (!eventFragment) {
               throw new Error(`🚨 Failed to get event fragment for ${eventName} on ${address}`);
             }
+            
             // Decode the log
             const decodedData = contract.interface.decodeEventLog(
               eventFragment,
               log.data,
               log.topics
             );
+            
             const args: Record<string, unknown> = {};
             eventFragment.inputs.forEach((input, index) => {
               args[input.name] = decodedData[index];
             });
+            
+            // Fetch block timestamp if not already cached
+            let timestamp: number;
+            if (!blockTimestamps[log.blockNumber]) {
+              try {
+                const block = await provider.getBlock(log.blockNumber);
+                if (block && block.timestamp) {
+                  blockTimestamps[log.blockNumber] = Number(block.timestamp);
+                } else {
+                  console.warn(`⚠️ Block ${log.blockNumber} has no timestamp, using current time`);
+                  blockTimestamps[log.blockNumber] = Math.floor(Date.now() / 1000);
+                }
+              } catch (error) {
+                console.warn(`⚠️ Failed to get block ${log.blockNumber}, using current time:`, error);
+                blockTimestamps[log.blockNumber] = Math.floor(Date.now() / 1000);
+              }
+            }
+            
+            timestamp = blockTimestamps[log.blockNumber];
+            
+            // Validate timestamp (ensure it's not in the future)
+            const now = Math.floor(Date.now() / 1000);
+            const isFutureTimestamp = timestamp > now;
+            
+            if (isFutureTimestamp) {
+              console.warn(`⚠️ Block ${log.blockNumber} has a future timestamp: ${timestamp}, using current time instead`);
+              timestamp = now;
+            }
+            
             // Organize the event as needed
             const blockExplorerBaseUrl = networkName === 'Ethereum Mainnet' ? 'https://etherscan.io' : 'https://explorer.zksync.io';
             const link = `${blockExplorerBaseUrl}/tx/${log.transactionHash}`;
-
-            // TODO: Fetch actual block timestamp if possible, otherwise estimate or handle appropriately
-            // For now, using a placeholder or potentially inaccurate estimation based on block number
-            // const block = await provider.getBlock(log.blockNumber); // This would be slow in a loop
-            // const blockTimestamp = block ? new Date(block.timestamp * 1000).toISOString() : new Date().toISOString(); // Fallback to current time
-            const blockTimestamp = new Date().toISOString(); // Placeholder: Using current time as timestamp is not reliable from logs alone
 
             const proposalLink = args.proposalId
               ? `https://vote.zknation.io/dao/proposal/${args.proposalId}?govId=eip155:${chainId}:${address}`
@@ -63,12 +92,12 @@ export const monitorEventsInRange = async (
               address,
               args,
               topics: [getCategory(address)],
-              timestamp: blockTimestamp, // Using placeholder timestamp
+              timestamp: String(timestamp), // Use actual block timestamp
               proposalLink,
-              networkName, // Use passed-in networkName
-              chainId: String(chainId) // Use passed-in chainId, converting to string
+              networkName, 
+              chainId: String(chainId)
             });
-          });
+          }
         } catch (err: unknown) {
           const errorMessage = `
             🚨 ERROR processing event ${eventName} on contract ${address} from block ${fromBlock} to ${toBlock}
