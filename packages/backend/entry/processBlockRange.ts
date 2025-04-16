@@ -15,7 +15,7 @@ import {
   ProcessingRecord
 } from "~/shared";
 import dotenv from "dotenv";
-import { monitorEventsInRange } from "~/shared/getEventsFromBatch"; // New batched events function
+import { monitorEventsInRange } from "~/shared/getEventsFromBatch";
 
 interface ProcessingState {
   lastProcessedBlock: number;
@@ -34,7 +34,7 @@ const LOCK_FILE_PATH = path.join(__dirname, "../data/processing-history.lock");
 const ARCHIVE_THRESHOLD = 1000;
 const MIN_TIME_BETWEEN_ARCHIVES = 10 * 60 * 1000; // 10 minutes
 
-async function downloadStateFile() {
+export async function downloadStateFile() {
   try {
     const dir = path.dirname(STATE_FILE_PATH);
     if (!fs.existsSync(dir)) {
@@ -47,7 +47,7 @@ async function downloadStateFile() {
   }
 }
 
-async function uploadStateFile() {
+export async function uploadStateFile() {
   try {
     if (!fs.existsSync(STATE_FILE_PATH)) {
       console.error("State file does not exist for upload");
@@ -63,7 +63,7 @@ async function uploadStateFile() {
   }
 }
 
-async function acquireLock(timeout = 5000): Promise<void> {
+export async function acquireLock(timeout = 5000): Promise<void> {
   return new Promise((resolve, reject) => {
     const start = Date.now();
     function tryLock() {
@@ -77,7 +77,7 @@ async function acquireLock(timeout = 5000): Promise<void> {
   });
 }
 
-async function releaseLock(): Promise<void> {
+export async function releaseLock(): Promise<void> {
   return new Promise((resolve, reject) => {
     fs.unlink(LOCK_FILE_PATH, (err) => {
       if (err) return reject(err);
@@ -89,11 +89,12 @@ async function releaseLock(): Promise<void> {
 /**
  * Processes a range of blocks in batches using the new batched log query.
  */
-async function processBlockRangeForNetwork(
+export async function processBlockRangeForNetwork(
   config: NetworkConfig,
   startBlock: number,
   endBlock: number,
-  batchSize: number = BATCH_SIZE
+  batchSize: number = BATCH_SIZE,
+  skipStateUpdate = false
 ) {
   console.log(`Processing ${config.networkName} blocks ${startBlock} to ${endBlock}`);
   const record: ProcessingRecord = {
@@ -135,11 +136,13 @@ async function processBlockRangeForNetwork(
         });
       }
       // Update state after finishing the batch
-      updateState(config.networkName, {
-        lastProcessedBlock: batchEnd,
-        hasError: false,
-        lastError: undefined
-      });
+      if (!skipStateUpdate) {
+        updateState(config.networkName, {
+          lastProcessedBlock: batchEnd,
+          hasError: false,
+          lastError: undefined
+        });
+      }
       batchStart = batchEnd;
     } catch (error) {
       console.error(`Error processing ${config.networkName} blocks ${batchStart} to ${batchEnd}:`, error);
@@ -148,11 +151,13 @@ async function processBlockRangeForNetwork(
         timestamp: new Date().toISOString(),
         error: error instanceof Error ? error.message : String(error)
       });
-      updateState(config.networkName, {
-        lastProcessedBlock: batchStart - 1,
-        hasError: true,
-        lastError: error instanceof Error ? error.message : String(error)
-      });
+      if (!skipStateUpdate) {
+        updateState(config.networkName, {
+          lastProcessedBlock: batchStart - 1,
+          hasError: true,
+          lastError: error instanceof Error ? error.message : String(error)
+        });
+      }
     }
 
     // Delay between batches if needed
@@ -161,11 +166,13 @@ async function processBlockRangeForNetwork(
     }
   }
 
-  await updateProcessingHistory(record);
+  if (!skipStateUpdate) {
+    await updateProcessingHistory(record);
+  }
   return foundEvents;
 }
 
-function updateState(network: string, state: Partial<ProcessingState>) {
+export function updateState(network: string, state: Partial<ProcessingState>) {
   const dir = path.dirname(STATE_FILE_PATH);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
@@ -187,7 +194,7 @@ function updateState(network: string, state: Partial<ProcessingState>) {
   console.log(`Updated state for ${network}:`, allStates[network]);
 }
 
-async function processLatestBlocks() {
+export async function processLatestBlocks() {
   try {
     await downloadStateFile();
 
@@ -290,7 +297,7 @@ async function processLatestBlocks() {
   }
 }
 
-async function updateProcessingHistory(newRecord: ProcessingRecord) {
+export async function updateProcessingHistory(newRecord: ProcessingRecord) {
   const tempPath = path.join(__dirname, "../data/processing-history.json");
   const dir = path.dirname(tempPath);
   try {
@@ -353,6 +360,58 @@ async function updateProcessingHistory(newRecord: ProcessingRecord) {
   }
 }
 
+/**
+ * Processes specific block ranges for testing or targeted processing.
+ * This function provides a clean interface for the test file to use.
+ */
+export async function processSpecificBlockRanges(
+  networkName: "Ethereum Mainnet" | "ZKSync",
+  startBlock: number,
+  endBlock: number,
+  options: {
+    skipStateUpdate?: boolean;
+    updateFeed?: boolean;
+  } = {}
+): Promise<boolean> {
+  try {
+    // Set up providers based on network
+    const provider = networkName === "Ethereum Mainnet" 
+      ? new ethers.JsonRpcProvider(process.env.ETHEREUM_RPC_URL, { chainId: 1, name: "mainnet" })
+      : new ethers.JsonRpcProvider(process.env.ZKSYNC_RPC_URL, { chainId: 324, name: "zksync-era" });
+    
+    // Prepare network config
+    const config: NetworkConfig = {
+      provider,
+      eventsMapping: EventsMapping[networkName === "Ethereum Mainnet" ? "Ethereum Mainnet" : "ZKsync Network"],
+      networkName,
+      chainId: networkName === "Ethereum Mainnet" ? 1 : 324,
+      blockExplorerUrl: networkName === "Ethereum Mainnet" ? "https://etherscan.io" : "https://explorer.zksync.io",
+      governanceName: networkName === "Ethereum Mainnet" ? "Ethereum Governance" : "ZKSync Governance",
+      pollInterval: 1000
+    };
+    
+    // Process the block range
+    const foundEvents = await processBlockRangeForNetwork(
+      config,
+      startBlock,
+      endBlock,
+      BATCH_SIZE,
+      options.skipStateUpdate
+    );
+    
+    // Update RSS feed if events were found and updateFeed option is true
+    if (foundEvents && options.updateFeed !== false) {
+      const updated = await updateRSSFeed();
+      console.log(updated ? "RSS feed updated" : "RSS feed unchanged");
+    }
+    
+    return foundEvents;
+  } catch (error) {
+    console.error(`Failed to process specific block range for ${networkName}:`, error);
+    throw error;
+  }
+}
+
 // Error handlers
 process.on("uncaughtException", (error) => {
   console.error("Uncaught exception:", error);
@@ -364,5 +423,7 @@ process.on("unhandledRejection", (error) => {
   process.exit(1);
 });
 
-// Run the process
-processLatestBlocks();
+// Only run the process if this file is being executed directly (not imported)
+if (require.main === module) {
+  processLatestBlocks();
+}

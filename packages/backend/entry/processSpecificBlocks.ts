@@ -2,10 +2,8 @@ import path from 'path';
 import { addEventToRSS, updateRSSFeed } from "../rss/utils";
 import { ethereumConfig, zkSyncConfig } from "../shared/constants";
 import dotenv from 'dotenv';
-import { ethers } from "ethers";
 import { convertBigIntToString } from "../shared/utils";
 import { monitorEventsAtBlock } from "../shared/getEventsAtBlock";
-import type { NetworkConfig } from "../shared/types";
 
 // Configuration
 dotenv.config({ path: path.resolve(__dirname, '../.env') });

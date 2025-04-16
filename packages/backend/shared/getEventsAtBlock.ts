@@ -1,5 +1,5 @@
 import { ethers } from "ethers";
-import { UnifiedMinimalABI, EventsMapping, ParsedEvent, getCategory, getGovBodyFromAddress } from "~/shared";
+import { UnifiedMinimalABI, ParsedEvent, getCategory, getGovBodyFromAddress } from "~/shared";
 
 export const monitorEventsAtBlock = async (
   blocknumber: number,
