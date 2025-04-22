@@ -16,7 +16,7 @@ import {
 } from "~/shared";
 import dotenv from "dotenv";
 import { monitorEventsInRange } from "~/shared/getEventsFromBatch";
-
+import { ParsedEvent } from "~/shared/types";
 interface ProcessingState {
   lastProcessedBlock: number;
   hasError: boolean;
@@ -33,6 +33,7 @@ const BATCH_DELAY = 1000;
 const LOCK_FILE_PATH = path.join(__dirname, "../data/processing-history.lock");
 const ARCHIVE_THRESHOLD = 1000;
 const MIN_TIME_BETWEEN_ARCHIVES = 10 * 60 * 1000; // 10 minutes
+const RSS_LOCK_FILE_PATH = path.join(__dirname, "../data/rss-feed.lock");
 
 export async function downloadStateFile() {
   try {
@@ -86,6 +87,29 @@ export async function releaseLock(): Promise<void> {
   });
 }
 
+export async function acquireRSSLock(timeout = 5000): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    function tryLock() {
+      fs.writeFile(RSS_LOCK_FILE_PATH, process.pid.toString(), { flag: "wx" }, (err) => {
+        if (!err) return resolve();
+        if (Date.now() - start > timeout) return reject(new Error("Could not acquire RSS lock"));
+        setTimeout(tryLock, 100);
+      });
+    }
+    tryLock();
+  });
+}
+
+export async function releaseRSSLock(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    fs.unlink(RSS_LOCK_FILE_PATH, (err) => {
+      if (err) return reject(err);
+      resolve();
+    });
+  });
+}
+
 /**
  * Processes a range of blocks in batches using the new batched log query.
  */
@@ -107,6 +131,8 @@ export async function processBlockRangeForNetwork(
   };
 
   let foundEvents = false;
+  const allEvents: ParsedEvent[] = []; // Store all events in memory
+
   // Process blocks in batches rather than one-by-one
   for (let batchStart = startBlock; batchStart <= endBlock; batchStart += batchSize) {
     const batchEnd = Math.min(batchStart + batchSize - 1, endBlock);
@@ -118,22 +144,7 @@ export async function processBlockRangeForNetwork(
       if (events.length > 0) {
         foundEvents = true;
         record.eventsFound += events.length;
-        events.forEach((event) => {
-          addEventToRSS(
-            event.address,
-            event.eventName,
-            event.topics,
-            event.title,
-            event.link,
-            config.networkName,
-            config.chainId,
-            event.blocknumber,
-            config.governanceName,
-            event.proposalLink,
-            event.timestamp,
-            convertBigIntToString(event.args)
-          );
-        });
+        allEvents.push(...events); // Store events in memory
       }
       // Update state after finishing the batch
       if (!skipStateUpdate) {
@@ -143,7 +154,6 @@ export async function processBlockRangeForNetwork(
           lastError: undefined
         });
       }
-      batchStart = batchEnd;
     } catch (error) {
       console.error(`Error processing ${config.networkName} blocks ${batchStart} to ${batchEnd}:`, error);
       record.errors.push({
@@ -169,6 +179,51 @@ export async function processBlockRangeForNetwork(
   if (!skipStateUpdate) {
     await updateProcessingHistory(record);
   }
+
+  // If we found events, update RSS feed with locking
+  if (foundEvents && allEvents.length > 0) {
+    try {
+      await acquireRSSLock();
+      console.log("Acquired RSS lock for feed update");
+      
+      // Add all events to RSS feed at once
+      for (const event of allEvents) {
+        addEventToRSS(
+          event.address,
+          event.eventName,
+          event.topics,
+          event.title,
+          event.link,
+          config.networkName,
+          config.chainId,
+          event.blocknumber,
+          config.governanceName,
+          event.proposalLink,
+          event.timestamp,
+          convertBigIntToString(event.args)
+        );
+      }
+      
+      // Update RSS feed once after all events are added
+      const updated = await updateRSSFeed();
+      console.log(updated ? "RSS feed updated" : "RSS feed unchanged");
+      
+      await releaseRSSLock();
+      console.log("Released RSS lock");
+    } catch (error) {
+      console.error("Error updating RSS feed:", error);
+      try {
+        if (fs.existsSync(RSS_LOCK_FILE_PATH)) {
+          await releaseRSSLock();
+          console.log("Released RSS lock after error");
+        }
+      } catch (releaseError) {
+        console.error("Failed to release RSS lock:", releaseError);
+      }
+      throw error;
+    }
+  }
+
   return foundEvents;
 }
 
@@ -235,7 +290,8 @@ export async function processLatestBlocks() {
     const ethereumStartBlock = (stateData["Ethereum Mainnet"]?.lastProcessedBlock ?? ethereumCurrentBlock - 100) + 1;
     const zksyncStartBlock = (stateData["ZKSync"]?.lastProcessedBlock ?? zksyncCurrentBlock - 100) + 1;
 
-    const [ethereumFoundEvents, zksyncFoundEvents] = await Promise.all([
+    // Process both networks in parallel
+    await Promise.all([
       processBlockRangeForNetwork(
         {
           provider: ethereumProvider,
@@ -269,11 +325,6 @@ export async function processLatestBlocks() {
       fs.writeFileSync(STATE_FILE_PATH, JSON.stringify(stateData, null, 2));
     }
     await uploadStateFile();
-
-    if (ethereumFoundEvents || zksyncFoundEvents) {
-      const updated = await updateRSSFeed();
-      console.log(updated ? "RSS feed updated" : "RSS feed unchanged");
-    }
 
     const dataDir = path.join(__dirname, "../data");
     if (fs.existsSync(dataDir)) {

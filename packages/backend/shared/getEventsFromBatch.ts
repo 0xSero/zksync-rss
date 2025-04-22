@@ -9,30 +9,37 @@ export const monitorEventsInRange = async (
   toBlock: number,
   provider: ethers.Provider,
   contractsConfig: { [address: string]: string[] },
-  networkName: string, // Added networkName
-  chainId: number      // Added chainId
+  networkName: string,
+  chainId: number
 ): Promise<ParsedEvent[]> => {
   console.time(`monitor-range-${fromBlock}-${toBlock}`);
   const collectedEvents: ParsedEvent[] = [];
+  
+  // Hoist blockTimestamps cache outside all loops
+  const blockTimestamps: Record<number, number> = {};
+  
   try {
-    // For each contract and its events, query the logs over the whole range
     for (const [address, events] of Object.entries(contractsConfig)) {
-      console.log(`🔍 Checking contract ${address} for events: ${events.join(", ")}`);
       const contract = new ethers.Contract(address, UnifiedMinimalABI, provider);
+      
       for (const eventName of events) {
         try {
-          const logs = await contract.queryFilter(eventName, fromBlock, toBlock);
+          const eventFragment = contract.interface.getEvent(eventName);
+          if (!eventFragment) {
+            throw new Error(`🚨 Failed to get event fragment for ${eventName} on ${address}`);
+          }
+
+          // Use provider.getLogs directly instead of queryFilter
+          const filter = {
+            address,
+            topics: [ethers.id(eventFragment.format())],
+            fromBlock,
+            toBlock
+          };
           
-          // Store a cache of block timestamps to avoid repeated fetches
-          const blockTimestamps: Record<number, number> = {};
+          const logs = await provider.getLogs(filter);
           
           for (const log of logs) {
-            const eventFragment = contract.interface.getEvent(eventName);
-            if (!eventFragment) {
-              throw new Error(`🚨 Failed to get event fragment for ${eventName} on ${address}`);
-            }
-            
-            // Decode the log
             const decodedData = contract.interface.decodeEventLog(
               eventFragment,
               log.data,
@@ -72,12 +79,13 @@ export const monitorEventsInRange = async (
               timestamp = now;
             }
             
-            // Organize the event as needed
+            // Convert proposalId to string if it exists
+            const pid = args.proposalId?.toString();
             const blockExplorerBaseUrl = networkName === 'Ethereum Mainnet' ? 'https://etherscan.io' : 'https://explorer.zksync.io';
             const link = `${blockExplorerBaseUrl}/tx/${log.transactionHash}`;
 
-            const proposalLink = args.proposalId
-              ? `https://vote.zknation.io/dao/proposal/${args.proposalId}?govId=eip155:${chainId}:${address}`
+            const proposalLink = pid
+              ? `https://vote.zknation.io/dao/proposal/${pid}?govId=eip155:${chainId}:${address}`
               : "";
 
             collectedEvents.push({
@@ -92,7 +100,7 @@ export const monitorEventsInRange = async (
               address,
               args,
               topics: [getCategory(address)],
-              timestamp: String(timestamp), // Use actual block timestamp
+              timestamp: String(timestamp),
               proposalLink,
               networkName, 
               chainId: String(chainId)
