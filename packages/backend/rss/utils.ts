@@ -87,23 +87,31 @@ class RSSFeedManager {
   private initialized = false;
   private seenGuids = new Set<string>();
   private items: ItemOptions[] = [];  // Single source of truth for items
+  private isTestMode = false;
 
   private constructor() {
     this.feed = new RSS(CONFIG.feed);
   }
 
-  static getInstance(): RSSFeedManager {
+  static getInstance(testMode = false): RSSFeedManager {
     if (!RSSFeedManager.instance) {
       RSSFeedManager.instance = new RSSFeedManager();
     }
+    RSSFeedManager.instance.isTestMode = testMode;
     return RSSFeedManager.instance;
   }
 
   async initialize() {
-    if (!this.initialized) {
-      await this.downloadExistingFeed();
-      this.initialized = true;
+    if (this.initialized) {
+      return; // Already initialized
     }
+    
+    if (!this.isTestMode) {
+      await this.downloadExistingFeed();
+    } else {
+      console.log('🧪 Test mode: Skipping GCS download');
+    }
+    this.initialized = true;
   }
 
   async downloadExistingFeed() {
@@ -111,23 +119,16 @@ class RSSFeedManager {
       const storage = new Storage();
       const bucket = storage.bucket(GCS_BUCKET_NAME);
       
-      // Get current feed
+      // Get current feed only
       const file = bucket.file(GCS_RSS_PATH);
       if ((await file.exists())[0]) {
         const [content] = await file.download();
         const result = await new Parser().parseString(content.toString());
         result.items?.forEach(item => this.addItemToFeed(item));
+        console.log(`Loaded ${this.seenGuids.size} unique items from main feed`);
+      } else {
+        console.log('No existing feed found, starting fresh');
       }
-
-      // Get archived items
-      const [files] = await bucket.getFiles({ prefix: GCS_ARCHIVE_PATH });
-      for (const file of files) {
-        const [content] = await file.download();
-        const result = await new Parser().parseString(content.toString());
-        result.items?.forEach(item => this.addItemToFeed(item));
-      }
-      
-      console.log(`Loaded ${this.seenGuids.size} unique items`);
     } catch (error) {
       console.error('Error downloading feed:', error);
       throw error;
@@ -183,6 +184,7 @@ class RSSFeedManager {
       link: event.link
     });
     
+    // Restore duplicate protection
     if (this.seenGuids.has(guid)) {
       console.log(`⚠️ Skipping duplicate event: ${event.title}`);
       return;
@@ -232,16 +234,49 @@ class RSSFeedManager {
 
   async upload(feed: RSS): Promise<boolean> {
     try {
-        const rssContent = feed.xml();
-        fs.mkdirSync(path.dirname(CONFIG.filePaths.output), { recursive: true });
-        fs.writeFileSync(CONFIG.filePaths.output, rssContent);
-        await uploadToGCS(GCS_BUCKET_NAME, CONFIG.filePaths.output, GCS_RSS_PATH, rssContent);
-        
-        return true;
+      const rssContent = feed.xml();
+      
+      // Ensure directory exists
+      fs.mkdirSync(path.dirname(CONFIG.filePaths.output), { recursive: true });
+      
+      // Write temporary feed file
+      console.log(`📝 Writing temporary feed to ${CONFIG.filePaths.output}`);
+      fs.writeFileSync(CONFIG.filePaths.output, rssContent);
+      
+      // Upload to GCS
+      console.log(`📤 Uploading feed to GCS (${GCS_RSS_PATH})`);
+      await uploadToGCS(GCS_BUCKET_NAME, CONFIG.filePaths.output, GCS_RSS_PATH, rssContent);
+      
+      // Clean up temporary file
+      console.log(`🧹 Cleaning up temporary feed file`);
+      if (fs.existsSync(CONFIG.filePaths.output)) {
+        fs.unlinkSync(CONFIG.filePaths.output);
+      }
+      
+      // After successful upload, update the internal items array to match what's in the feed
+      const feedItems = (feed as RSSWithItems).items;
+      this.items = feedItems;
+      console.log(`✅ Feed updated successfully with ${feedItems.length} items`);
+      
+      return true;
     } catch (error) {
-        console.error('Failed to upload RSS feed:', error);
-        return false;
+      console.error('Failed to upload RSS feed:', error);
+      // Clean up on error too
+      if (fs.existsSync(CONFIG.filePaths.output)) {
+        fs.unlinkSync(CONFIG.filePaths.output);
+      }
+      return false;
     }
+  }
+
+  // Add a method to update internal items
+  updateItems(newItems: ItemOptions[]) {
+    this.items = [...newItems];
+    // Update seenGuids to match the new items
+    this.seenGuids.clear();
+    this.items.forEach(item => {
+      if (item.guid) this.seenGuids.add(item.guid);
+    });
   }
 }
 
@@ -274,7 +309,11 @@ export const updateRSSFeed = async () => {
   const feed = await manager.generate(); // Items are now sorted newest first
   const items = (feed as RSSWithItems).items;
   
-  console.log(`📊 Generated RSS feed with ${items.length} items`);
+  console.log(`📊 Current feed status:
+  - Total items: ${items.length}
+  - Newest item: ${items[0]?.title || 'none'}
+  - Oldest item: ${items[items.length - 1]?.title || 'none'}
+  `);
   
   if (items.length > ARCHIVE_ITEM_THRESHOLD) {
     console.log(`📦 Archiving items: keeping ${ARCHIVE_ITEM_THRESHOLD} of ${items.length} items in main feed`);
@@ -284,25 +323,50 @@ export const updateRSSFeed = async () => {
     // Archive older items
     const itemsToArchive = items.slice(ARCHIVE_ITEM_THRESHOLD);
     
-    // Create and upload archive of older items
+    // Create archive feed with older items
     const archiveFeed = new RSS(CONFIG.feed);
     itemsToArchive.forEach(item => archiveFeed.item(item));
     
-    // Log the archive details
-    console.log(`📦 Creating archive with ${itemsToArchive.length} items`);
+    // Generate a unique archive name based on content
+    const archiveContent = archiveFeed.xml();
+    const archiveHash = ethers.keccak256(ethers.toUtf8Bytes(archiveContent)).slice(2, 10);
+    const archivePath = `${GCS_ARCHIVE_PATH}/archive-${archiveHash}-${Date.now()}.xml`;
     
-    await uploadToGCS(
-      GCS_BUCKET_NAME,
-      CONFIG.filePaths.output,
-      `${GCS_ARCHIVE_PATH}/archive-${Date.now()}.xml`,
-      archiveFeed.xml()
-    );
+    // Check if an archive with this hash already exists
+    const storage = new Storage();
+    const bucket = storage.bucket(GCS_BUCKET_NAME);
+    const [files] = await bucket.getFiles({ prefix: GCS_ARCHIVE_PATH });
+    const existingArchive = files.find(file => file.name.includes(archiveHash));
+    
+    if (!existingArchive) {
+      // Only create new archive if content is unique
+      console.log(`📦 Creating new archive with ${itemsToArchive.length} items
+      - First archived item: ${itemsToArchive[0]?.title}
+      - Last archived item: ${itemsToArchive[itemsToArchive.length - 1]?.title}
+      `);
+      await uploadToGCS(
+        GCS_BUCKET_NAME,
+        CONFIG.filePaths.output,
+        archivePath,
+        archiveContent
+      );
+    } else {
+      console.log(`📦 Archive with this content already exists (${existingArchive.name}), skipping archive creation`);
+    }
     
     // Update main feed with newest items
     const newFeed = new RSS(CONFIG.feed);
     itemsToKeep.forEach(item => newFeed.item(item));
     
-    console.log(`📤 Uploading main feed with ${itemsToKeep.length} items`);
+    console.log(`📤 Preparing main feed update:
+    - Items to keep: ${itemsToKeep.length}
+    - Newest item: ${itemsToKeep[0]?.title}
+    - Oldest item: ${itemsToKeep[itemsToKeep.length - 1]?.title}
+    `);
+    
+    // Update the manager's internal state to only keep the non-archived items
+    manager.updateItems(itemsToKeep);
+    
     return await manager.upload(newFeed);
   }
   

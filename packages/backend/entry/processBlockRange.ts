@@ -450,12 +450,6 @@ export async function processSpecificBlockRanges(
       options.skipStateUpdate
     );
     
-    // Update RSS feed if events were found and updateFeed option is true
-    if (foundEvents && options.updateFeed !== false) {
-      const updated = await updateRSSFeed();
-      console.log(updated ? "RSS feed updated" : "RSS feed unchanged");
-    }
-    
     return foundEvents;
   } catch (error) {
     console.error(`Failed to process specific block range for ${networkName}:`, error);
