@@ -4,7 +4,7 @@ import dotenv from "dotenv";
 import {
   uploadToGCS,
   GCS_BUCKET_NAME,
-} from "~/shared";
+} from "../shared";
 import { 
   processSpecificBlockRanges, 
   downloadStateFile, 
