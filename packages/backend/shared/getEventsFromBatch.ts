@@ -1,5 +1,6 @@
 import { ethers } from "ethers";
 import { UnifiedMinimalABI, ParsedEvent, getCategory, getGovBodyFromAddress } from "~/shared";
+import { getBlockCache } from "./blockCache";
 
 /**
  * Queries logs for multiple contracts and events over a block range.
@@ -22,9 +23,13 @@ export const monitorEventsInRange = async (
   const uniqueBlocks = new Set<number>();
   
   try {
-    // First pass: collect all logs and unique block numbers
-    const allLogs: Array<{log: any, contract: ethers.Contract, eventFragment: any, eventName: string, address: string}> = [];
-    
+    // Aggressive optimization: Use single getLogs call for all addresses
+    // This reduces multiple API calls to just ONE call
+    const allAddresses = Object.keys(contractsConfig);
+    const allEventTopics: string[] = [];
+    const eventMap = new Map<string, { address: string, eventName: string, contract: ethers.Contract, eventFragment: any }>();
+
+    // Build comprehensive topic list and contract map
     for (const [address, events] of Object.entries(contractsConfig)) {
       const contract = new ethers.Contract(address, UnifiedMinimalABI, provider);
       
@@ -35,57 +40,101 @@ export const monitorEventsInRange = async (
             throw new Error(`🚨 Failed to get event fragment for ${eventName} on ${address}`);
           }
 
-          // Use provider.getLogs directly instead of queryFilter
-          const filter = {
-            address,
-            topics: [ethers.id(eventFragment.format())],
-            fromBlock,
-            toBlock
-          };
-          
-          const logs = await provider.getLogs(filter);
-          
-          for (const log of logs) {
-            allLogs.push({log, contract, eventFragment, eventName, address});
-            uniqueBlocks.add(log.blockNumber);
-          }
+          const topic = ethers.id(eventFragment.format());
+          allEventTopics.push(topic);
+          eventMap.set(`${address}-${topic}`, { address, eventName, contract, eventFragment });
         } catch (err: unknown) {
-          const errorMessage = `
-            🚨 ERROR processing event ${eventName} on contract ${address} from block ${fromBlock} to ${toBlock}
-            Error: ${err instanceof Error ? err.message : String(err)}
-          `;
+          const errorMessage = `🚨 ERROR processing event ${eventName} on contract ${address}`;
           console.error(errorMessage);
           throw new Error(errorMessage);
         }
       }
     }
 
-    // Batch fetch all unique block timestamps with limited concurrency
-    const blockNumbers = Array.from(uniqueBlocks);
-    const concurrency = 8; // keep modest to avoid rate spikes
-    const delayMs = 50;    // tiny pacing between waves
+    // SINGLE API CALL for all contracts and events
+    console.log(`🚀 Making single getLogs call for ${allAddresses.length} addresses and ${allEventTopics.length} events`);
+    const filter = {
+      address: allAddresses,
+      topics: [allEventTopics], // OR condition for all event topics
+      fromBlock,
+      toBlock
+    };
+    
+    const allRawLogs = await provider.getLogs(filter);
+    console.log(`📦 Received ${allRawLogs.length} raw logs from single API call`);
 
-    for (let i = 0; i < blockNumbers.length; i += concurrency) {
-      const slice = blockNumbers.slice(i, i + concurrency);
-      await Promise.all(
-        slice.map(async (blockNumber) => {
-          try {
-            const block = await provider.getBlock(blockNumber);
-            if (block && block.timestamp) {
-              blockTimestamps[blockNumber] = Number(block.timestamp);
-            } else {
-              console.warn(`⚠️ Block ${blockNumber} has no timestamp, using current time`);
-              blockTimestamps[blockNumber] = Math.floor(Date.now() / 1000);
-            }
-          } catch (error) {
-            console.warn(`⚠️ Failed to get block ${blockNumber}, using current time:`, error);
-            blockTimestamps[blockNumber] = Math.floor(Date.now() / 1000);
-          }
-        })
-      );
-      if (i + concurrency < blockNumbers.length) {
-        await new Promise((r) => setTimeout(r, delayMs));
+    // Parse logs into structured events
+    const allLogs: Array<{log: any, contract: ethers.Contract, eventFragment: any, eventName: string, address: string}> = [];
+    
+    for (const log of allRawLogs) {
+      const topic = log.topics[0];
+      const eventInfo = eventMap.get(`${log.address}-${topic}`);
+      
+      if (eventInfo) {
+        allLogs.push({
+          log,
+          contract: eventInfo.contract,
+          eventFragment: eventInfo.eventFragment,
+          eventName: eventInfo.eventName,
+          address: eventInfo.address
+        });
+        uniqueBlocks.add(log.blockNumber);
       }
+    }
+
+    // Use persistent cache to avoid repeated API calls
+    const blockCache = getBlockCache(networkName);
+    const blockNumbers = Array.from(uniqueBlocks);
+    const uncachedBlocks: number[] = [];
+
+    // Check cache first - this eliminates most API calls
+    for (const blockNumber of blockNumbers) {
+      const cachedTimestamp = blockCache.get(blockNumber);
+      if (cachedTimestamp !== null) {
+        blockTimestamps[blockNumber] = cachedTimestamp;
+      } else {
+        uncachedBlocks.push(blockNumber);
+      }
+    }
+
+    console.log(`Cache hit: ${blockNumbers.length - uncachedBlocks.length}/${blockNumbers.length} blocks. API calls needed: ${uncachedBlocks.length}`);
+
+    // Only fetch uncached blocks with aggressive limits
+    if (uncachedBlocks.length > 0) {
+      const concurrency = 3; // Very conservative to minimize CU usage
+      const delayMs = 200;   // Longer delays between waves
+
+      for (let i = 0; i < uncachedBlocks.length; i += concurrency) {
+        const slice = uncachedBlocks.slice(i, i + concurrency);
+        await Promise.all(
+          slice.map(async (blockNumber) => {
+            try {
+              const block = await provider.getBlock(blockNumber);
+              if (block && block.timestamp) {
+                const timestamp = Number(block.timestamp);
+                blockTimestamps[blockNumber] = timestamp;
+                blockCache.set(blockNumber, timestamp); // Cache for future use
+              } else {
+                console.warn(`⚠️ Block ${blockNumber} has no timestamp, using current time`);
+                const fallback = Math.floor(Date.now() / 1000);
+                blockTimestamps[blockNumber] = fallback;
+                blockCache.set(blockNumber, fallback);
+              }
+            } catch (error) {
+              console.warn(`⚠️ Failed to get block ${blockNumber}, using current time:`, error);
+              const fallback = Math.floor(Date.now() / 1000);
+              blockTimestamps[blockNumber] = fallback;
+              blockCache.set(blockNumber, fallback);
+            }
+          })
+        );
+        if (i + concurrency < uncachedBlocks.length) {
+          await new Promise((r) => setTimeout(r, delayMs));
+        }
+      }
+      
+      // Save cache after fetching new blocks
+      blockCache.flush();
     }
 
     // Second pass: process all logs with cached timestamps
