@@ -22,6 +22,10 @@ interface ProcessingState {
   hasError: boolean;
   lastError?: string;
   lastUpdated: string;
+  retryCount?: number;
+  consecutiveFailures?: number;
+  skippedBatches?: number[];
+  apiCallCount?: number;
 }
 
 // Configuration
@@ -30,6 +34,10 @@ dotenv.config({ path: path.resolve(__dirname, "../.env") });
 const STATE_FILE_PATH = path.join(__dirname, "../data/processing-state.json");
 const BATCH_SIZE = 100;
 const BATCH_DELAY = 1000;
+const API_CALL_DELAY = 100; // Delay between API calls to prevent rate limiting
+const MAX_BATCH_RETRIES = 3; // Maximum retries per batch
+const MAX_CONSECUTIVE_FAILURES = 5; // Circuit breaker threshold
+const RETRY_DELAY_BASE = 5000; // Base delay for exponential backoff
 const LOCK_FILE_PATH = path.join(__dirname, "../data/processing-history.lock");
 const ARCHIVE_THRESHOLD = 1000;
 const MIN_TIME_BETWEEN_ARCHIVES = 10 * 60 * 1000; // 10 minutes
@@ -132,46 +140,106 @@ export async function processBlockRangeForNetwork(
 
   let foundEvents = false;
   const allEvents: ParsedEvent[] = []; // Store all events in memory
+  let consecutiveFailures = 0;
+  let apiCallCount = 0;
+  const batchRetries: Record<number, number> = {}; // Track retries per batch start block
 
   // Process blocks in batches rather than one-by-one
   for (let batchStart = startBlock; batchStart <= endBlock; batchStart += batchSize) {
+    // Circuit breaker: stop if too many consecutive failures
+    if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+      console.error(`Circuit breaker triggered: ${consecutiveFailures} consecutive failures. Stopping processing.`);
+      record.errors.push({
+        block: batchStart,
+        timestamp: new Date().toISOString(),
+        error: `Circuit breaker triggered after ${consecutiveFailures} consecutive failures`
+      });
+      break;
+    }
+
     const batchEnd = Math.min(batchStart + batchSize - 1, endBlock);
-    console.log(`Processing ${config.networkName} batch: ${batchStart} to ${batchEnd}`);
+    const retryCount = batchRetries[batchStart] || 0;
+    
+    // Skip batch if it has exceeded max retries
+    if (retryCount >= MAX_BATCH_RETRIES) {
+      console.warn(`Skipping batch ${batchStart}-${batchEnd} after ${retryCount} failed attempts`);
+      record.errors.push({
+        block: batchStart,
+        timestamp: new Date().toISOString(),
+        error: `Batch skipped after ${retryCount} failed attempts`
+      });
+      continue;
+    }
+
+    console.log(`Processing ${config.networkName} batch: ${batchStart} to ${batchEnd} (attempt ${retryCount + 1}/${MAX_BATCH_RETRIES})`);
 
     try {
+      // Rate limiting: add delay before API calls
+      if (apiCallCount > 0) {
+        await new Promise(resolve => setTimeout(resolve, API_CALL_DELAY));
+      }
+      
       // Use the new batched query function
       const events = await monitorEventsInRange(batchStart, batchEnd, config.provider, config.eventsMapping, config.networkName, config.chainId);
+      apiCallCount++; // Track API usage
+      
       if (events.length > 0) {
         foundEvents = true;
         record.eventsFound += events.length;
         allEvents.push(...events); // Store events in memory
+        console.log(`Found ${events.length} events in batch ${batchStart}-${batchEnd}`);
       }
+      
+      // Success: reset failure counters
+      consecutiveFailures = 0;
+      batchRetries[batchStart] = 0;
+      
       // Update state after finishing the batch
       if (!skipStateUpdate) {
         updateState(config.networkName, {
           lastProcessedBlock: batchEnd,
           hasError: false,
-          lastError: undefined
+          lastError: undefined,
+          consecutiveFailures: 0,
+          apiCallCount: apiCallCount
         });
       }
     } catch (error) {
-      console.error(`Error processing ${config.networkName} blocks ${batchStart} to ${batchEnd}:`, error);
+      consecutiveFailures++;
+      batchRetries[batchStart] = retryCount + 1;
+      
+      console.error(`Error processing ${config.networkName} blocks ${batchStart} to ${batchEnd} (attempt ${retryCount + 1}):`, error);
       record.errors.push({
         block: batchStart,
         timestamp: new Date().toISOString(),
         error: error instanceof Error ? error.message : String(error)
       });
+      
+      // Don't update lastProcessedBlock on failure - let it retry or skip
       if (!skipStateUpdate) {
         updateState(config.networkName, {
-          lastProcessedBlock: batchStart - 1,
           hasError: true,
-          lastError: error instanceof Error ? error.message : String(error)
+          lastError: error instanceof Error ? error.message : String(error),
+          retryCount: retryCount + 1,
+          consecutiveFailures: consecutiveFailures,
+          apiCallCount: apiCallCount
         });
       }
+      
+      // Exponential backoff for retries. Always rewind batchStart so the next
+      // loop iteration re-evaluates this same batch (either to retry or to skip
+      // if we've hit MAX_BATCH_RETRIES). This avoids silently skipping ranges.
+      if (retryCount < MAX_BATCH_RETRIES - 1) {
+        const delay = RETRY_DELAY_BASE * Math.pow(2, retryCount);
+        console.log(`Waiting ${delay}ms before retry...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+      // Rewind to re-check this batch on next iteration (retry or skip branch)
+      batchStart -= batchSize;
     }
 
     // Delay between batches if needed
-    if (batchEnd < endBlock) {
+    if (batchEnd < endBlock && consecutiveFailures === 0) {
       await new Promise((resolve) => setTimeout(resolve, BATCH_DELAY));
     }
   }
@@ -179,6 +247,8 @@ export async function processBlockRangeForNetwork(
   if (!skipStateUpdate) {
     await updateProcessingHistory(record);
   }
+  
+  console.log(`Completed processing: API calls made: ${apiCallCount}, Events found: ${record.eventsFound}, Errors: ${record.errors.length}`);
 
   // If we found events, update RSS feed with locking
   if (foundEvents && allEvents.length > 0) {
