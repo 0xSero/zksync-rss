@@ -10,6 +10,7 @@
     "process-blocks": "tsx ./entry/processBlockRange.ts",
     "process-specific-blocks": "tsx ./entry/processSpecificBlocks.ts",
     "process-historic-blocks": "tsx ./entry/processHistoricBlocks.ts",
+    "catchup-block-range": "tsx ./entry/catchupBlockRange.ts",
     "build": "tsc",
     "test:blocks": "npx tsx tests/processBlockRangeTest.ts",
     "test:blocks:eth": "npx tsx tests/processBlockRangeTest.ts ethereum",

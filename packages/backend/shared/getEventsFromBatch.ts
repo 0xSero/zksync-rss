@@ -2,6 +2,68 @@ import { ethers } from "ethers";
 import { UnifiedMinimalABI, ParsedEvent, getCategory, getGovBodyFromAddress } from "~/shared";
 import { getBlockCache } from "./blockCache";
 
+type LogFilterInput = {
+  address?: string | string[];
+  topics?: (string | string[] | null)[];
+  fromBlock?: number;
+  toBlock?: number;
+};
+
+const toHexBlock = (block?: number | string): string | undefined => {
+  if (block === undefined || block === null) {
+    return undefined;
+  }
+  if (typeof block === "string") {
+    return block.startsWith("0x") ? block : ethers.toBeHex(BigInt(block));
+  }
+  return ethers.toBeHex(block);
+};
+
+const buildRpcFilter = (filter: LogFilterInput) => {
+  const { address, topics } = filter;
+  const fromBlock = toHexBlock(filter.fromBlock);
+  const toBlock = toHexBlock(filter.toBlock);
+  return {
+    address,
+    topics,
+    fromBlock,
+    toBlock
+  };
+};
+
+const getLogsWithPagination = async (provider: ethers.Provider, filter: LogFilterInput): Promise<ethers.Log[]> => {
+  const rpcFilter = buildRpcFilter(filter);
+  const logs: ethers.Log[] = [];
+  let pageKey: string | undefined;
+
+  const makeRequest = async (page?: string) => {
+    const request = page ? { ...rpcFilter, pageKey: page } : rpcFilter;
+    return provider.send("alchemy_getLogs", [request]);
+  };
+
+  try {
+    do {
+      const response = await makeRequest(pageKey);
+
+      if (Array.isArray(response)) {
+        logs.push(...response);
+        break;
+      }
+
+      if (response?.logs) {
+        logs.push(...response.logs);
+      }
+
+      pageKey = response?.pageKey;
+    } while (pageKey);
+
+    return logs;
+  } catch (error) {
+    console.warn("⚠️ alchemy_getLogs unavailable, falling back to eth_getLogs", error);
+    return provider.getLogs(filter as ethers.Filter);
+  }
+};
+
 /**
  * Queries logs for multiple contracts and events over a block range.
  */
@@ -59,8 +121,8 @@ export const monitorEventsInRange = async (
       fromBlock,
       toBlock
     };
-    
-    const allRawLogs = await provider.getLogs(filter);
+
+    const allRawLogs = await getLogsWithPagination(provider, filter);
     console.log(`📦 Received ${allRawLogs.length} raw logs from single API call`);
 
     // Parse logs into structured events
@@ -201,4 +263,8 @@ export const monitorEventsInRange = async (
   } finally {
     console.timeEnd(`monitor-range-${fromBlock}-${toBlock}`);
   }
+};
+
+export const __private__ = {
+  getLogsWithPagination
 };

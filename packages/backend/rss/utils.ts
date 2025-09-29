@@ -1,6 +1,7 @@
 import RSS, { ItemOptions } from "rss";
 import { ethers } from "ethers";
 import { uploadToGCS, GCS_BUCKET_NAME, GCS_RSS_PATH, GCS_ARCHIVE_PATH, ARCHIVE_ITEM_THRESHOLD } from "~/shared";
+import { getEventGuid, normalizeArgs } from "~/shared/feedPreview";
 import { Storage } from '@google-cloud/storage';
 import Parser from 'rss-parser';
 import fs from 'fs';
@@ -61,24 +62,6 @@ function parseEventDate(timestamp: string | number): Date | null {
     return new Date(parsed);
   }
   return null;
-}
-
-// Generate a consistent GUID for events
-function getEventGuid(event: {
-  networkName: string,
-  chainId: number,
-  title: string,
-  block: number,
-  link: string
-}): string {
-  const normalized = [
-    event.networkName.toLowerCase().replace(/\s+/g, ""),
-    event.chainId,
-    event.title.toLowerCase().replace(/\s+/g, ""),
-    event.block,
-    event.link.toLowerCase()
-  ].join("-");
-  return ethers.keccak256(ethers.toUtf8Bytes(normalized));
 }
 
 class RSSFeedManager {
@@ -193,6 +176,8 @@ class RSSFeedManager {
     console.log(`✅ Adding new event: ${event.title} with date ${date.toISOString()}`);
     this.seenGuids.add(guid);
     
+    const normalizedArgs = normalizeArgs(event.eventArgs);
+
     this.items.push({
       title: event.title,
       url: event.link,
@@ -209,7 +194,7 @@ class RSSFeedManager {
           contractAddress: event.address,
           proposalLink: event.proposalLink
         },
-        eventData: event.eventArgs
+        eventData: normalizedArgs
       }),
       author: event.govBody,
       categories: event.topics,
