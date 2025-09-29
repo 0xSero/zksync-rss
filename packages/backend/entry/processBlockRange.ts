@@ -40,7 +40,6 @@ interface ProcessingState {
 dotenv.config({ path: path.resolve(__dirname, "../.env") });
 
 const STATE_FILE_PATH = path.join(__dirname, "../data/processing-state.json");
-const DEFAULT_BATCH_SIZE = 100; // Kept for compatibility with tests, not used directly in adaptive mode
 const API_CALL_DELAY = 100; // Delay between API calls to prevent rate limiting
 const RETRY_DELAY_BASE = 5000; // Base delay for exponential backoff when retrying segments
 const MAX_SEGMENT_ATTEMPTS = 3; // Maximum retries per segment before giving up
@@ -141,7 +140,10 @@ async function collectEventsWithAdaptiveRange(
   const failedSegments: { from: number; to: number; error: string }[] = [];
 
   while (segments.length > 0) {
-    const segment = segments.shift()!;
+    const segment = segments.shift();
+    if (!segment) {
+      break;
+    }
 
     if (segment.from > segment.to) {
       continue;
@@ -223,7 +225,6 @@ export async function processBlockRangeForNetwork(
   config: NetworkConfig,
   startBlock: number,
   endBlock: number,
-  _batchSize: number = DEFAULT_BATCH_SIZE,
   skipStateUpdate = false,
   options: { updateFeed?: boolean } = {}
 ) {
@@ -575,7 +576,6 @@ export async function processSpecificBlockRanges(
       config,
       startBlock,
       endBlock,
-      DEFAULT_BATCH_SIZE,
       options.skipStateUpdate,
       { updateFeed: options.updateFeed }
     );

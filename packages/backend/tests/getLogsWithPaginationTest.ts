@@ -8,7 +8,7 @@ type Filter = ethers.Filter;
 type RpcResponse = { logs?: Log[]; pageKey?: string } | Log[];
 
 class MockProvider {
-  public sendCalls: { method: string; params: any[] }[] = [];
+  public sendCalls: { method: string; params: unknown[] }[] = [];
   public getLogsCalls: Filter[] = [];
   private responses: RpcResponse[];
   private readonly fallbackLogs: Log[];
@@ -20,7 +20,7 @@ class MockProvider {
     this.throwOnSend = options.throwOnSend ?? false;
   }
 
-  async send(method: string, params: any[]): Promise<RpcResponse> {
+  async send(method: string, params: unknown[]): Promise<RpcResponse> {
     this.sendCalls.push({ method, params });
 
     if (this.throwOnSend) {

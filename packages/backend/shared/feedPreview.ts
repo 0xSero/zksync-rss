@@ -24,6 +24,23 @@ export interface FeedSummary {
 
 const DEFAULT_PREVIEW_PATH = path.join(__dirname, "../data/merged-feed-preview.xml");
 
+type FeedDescription = {
+  eventDetails?: {
+    network?: string;
+    block?: number;
+    timestamp?: string | number;
+  };
+  eventData?: {
+    txhash?: string;
+    transactionHash?: string;
+  };
+};
+
+type ExtendedParserItem = Parser.Item & {
+  [key: string]: unknown;
+  "content:encoded"?: string;
+};
+
 export const ensureIsoString = (value: string | number | undefined): string => {
   if (value === undefined || value === null) {
     return new Date(0).toISOString();
@@ -103,26 +120,29 @@ export const loadExistingFeedSummaries = async (): Promise<FeedSummary[]> => {
     const feed = await parser.parseString(xml);
     const summaries: FeedSummary[] = [];
 
-    for (const item of feed.items ?? []) {
+    for (const item of (feed.items as ExtendedParserItem[] | undefined) ?? []) {
       const guid = item.guid || item.id || item.link || item.title;
       if (!guid) {
         continue;
       }
 
-      let parsedDescription: any = undefined;
-      const rawDescription = item.content || (item as any)["content:encoded"] || item.description || "";
+      let parsedDescription: FeedDescription | null = null;
+      const rawDescription =
+        (typeof item.content === "string" ? item.content : undefined) ??
+        (typeof item["content:encoded"] === "string" ? item["content:encoded"] : undefined) ??
+        (typeof item.description === "string" ? item.description : "");
       try {
         if (typeof rawDescription === "string" && rawDescription.trim().length > 0) {
-          parsedDescription = JSON.parse(rawDescription);
+          parsedDescription = JSON.parse(rawDescription) as FeedDescription;
         }
       } catch (err) {
         console.warn(`⚠️ Failed to parse feed item description for guid ${guid}:`, err);
       }
 
-      const network = parsedDescription?.eventDetails?.network || "unknown";
+      const network = parsedDescription?.eventDetails?.network ?? "unknown";
       const block = parsedDescription?.eventDetails?.block;
-      const timestampSource = parsedDescription?.eventDetails?.timestamp || item.isoDate || item.pubDate;
-      const txhash = parsedDescription?.eventData?.txhash || parsedDescription?.eventData?.transactionHash;
+      const timestampSource = parsedDescription?.eventDetails?.timestamp ?? item.isoDate ?? item.pubDate;
+      const txhash = parsedDescription?.eventData?.txhash ?? parsedDescription?.eventData?.transactionHash;
       const categories = Array.isArray(item.categories) ? item.categories : [];
       const author = item.creator || item.author || "";
 

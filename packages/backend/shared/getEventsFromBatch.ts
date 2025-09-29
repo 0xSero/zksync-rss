@@ -1,4 +1,4 @@
-import { ethers } from "ethers";
+import { ethers, type JsonRpcProvider, type ParamType } from "ethers";
 import { UnifiedMinimalABI, ParsedEvent, getCategory, getGovBodyFromAddress } from "~/shared";
 import { getBlockCache } from "./blockCache";
 
@@ -7,6 +7,21 @@ type LogFilterInput = {
   topics?: (string | string[] | null)[];
   fromBlock?: number;
   toBlock?: number;
+};
+
+type EventInfo = {
+  address: string;
+  eventName: string;
+  contract: ethers.Contract;
+  eventFragment: ethers.EventFragment;
+};
+
+type ParsedLog = {
+  log: ethers.Log;
+  contract: ethers.Contract;
+  eventFragment: ethers.EventFragment;
+  eventName: string;
+  address: string;
 };
 
 const toHexBlock = (block?: number | string): string | undefined => {
@@ -31,7 +46,16 @@ const buildRpcFilter = (filter: LogFilterInput) => {
   };
 };
 
+const isJsonRpcProvider = (provider: ethers.Provider): provider is JsonRpcProvider => {
+  return typeof (provider as JsonRpcProvider).send === "function";
+};
+
 const getLogsWithPagination = async (provider: ethers.Provider, filter: LogFilterInput): Promise<ethers.Log[]> => {
+  if (!isJsonRpcProvider(provider)) {
+    console.warn("⚠️ Provider does not support alchemy_getLogs, falling back to eth_getLogs");
+    return provider.getLogs(filter as ethers.Filter);
+  }
+
   const rpcFilter = buildRpcFilter(filter);
   const logs: ethers.Log[] = [];
   let pageKey: string | undefined;
@@ -89,7 +113,7 @@ export const monitorEventsInRange = async (
     // This reduces multiple API calls to just ONE call
     const allAddresses = Object.keys(contractsConfig);
     const allEventTopics: string[] = [];
-    const eventMap = new Map<string, { address: string, eventName: string, contract: ethers.Contract, eventFragment: any }>();
+    const eventMap = new Map<string, EventInfo>();
 
     // Build comprehensive topic list and contract map
     for (const [address, events] of Object.entries(contractsConfig)) {
@@ -126,7 +150,7 @@ export const monitorEventsInRange = async (
     console.log(`📦 Received ${allRawLogs.length} raw logs from single API call`);
 
     // Parse logs into structured events
-    const allLogs: Array<{log: any, contract: ethers.Contract, eventFragment: any, eventName: string, address: string}> = [];
+    const allLogs: ParsedLog[] = [];
     
     for (const log of allRawLogs) {
       const topic = log.topics[0];
@@ -205,10 +229,11 @@ export const monitorEventsInRange = async (
         eventFragment,
         log.data,
         log.topics
-      );
+      ) as ethers.Result;
       
       const args: Record<string, unknown> = {};
-      eventFragment.inputs.forEach((input, index) => {
+      const inputs = eventFragment.inputs as readonly ParamType[];
+      inputs.forEach((input: ParamType, index: number) => {
         args[input.name] = decodedData[index];
       });
       
