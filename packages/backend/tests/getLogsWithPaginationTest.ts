@@ -79,8 +79,9 @@ async function testPagination(): Promise<void> {
   assert.equal(provider.sendCalls.length, 2, "should call alchemy_getLogs twice");
   const firstCall = provider.sendCalls[0];
   assert.equal(firstCall.method, "alchemy_getLogs");
-  assert.equal(firstCall.params[0].fromBlock, ethers.toBeHex(23048076));
-  assert.equal(firstCall.params[0].toBlock, ethers.toBeHex(23048080));
+  const params0 = firstCall.params[0] as { fromBlock: string; toBlock: string };
+  assert.equal(params0.fromBlock, ethers.toBeHex(23048076));
+  assert.equal(params0.toBlock, ethers.toBeHex(23048080));
 }
 
 async function testFallback(): Promise<void> {

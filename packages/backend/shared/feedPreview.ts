@@ -121,10 +121,13 @@ export const loadExistingFeedSummaries = async (): Promise<FeedSummary[]> => {
     const summaries: FeedSummary[] = [];
 
     for (const item of (feed.items as ExtendedParserItem[] | undefined) ?? []) {
-      const guid = item.guid || item.id || item.link || item.title;
-      if (!guid) {
+      const guidCandidate = [item.guid, (item as Record<string, unknown>).id, item.link, item.title].find(
+        (value): value is string => typeof value === "string"
+      );
+      if (!guidCandidate) {
         continue;
       }
+      const guid = guidCandidate;
 
       let parsedDescription: FeedDescription | null = null;
       const rawDescription =
@@ -144,7 +147,11 @@ export const loadExistingFeedSummaries = async (): Promise<FeedSummary[]> => {
       const timestampSource = parsedDescription?.eventDetails?.timestamp ?? item.isoDate ?? item.pubDate;
       const txhash = parsedDescription?.eventData?.txhash ?? parsedDescription?.eventData?.transactionHash;
       const categories = Array.isArray(item.categories) ? item.categories : [];
-      const author = item.creator || item.author || "";
+      const author = typeof item.creator === "string"
+        ? item.creator
+        : typeof (item as Record<string, unknown>).author === "string"
+          ? ((item as Record<string, unknown>).author as string)
+          : "";
 
       summaries.push({
         guid,
