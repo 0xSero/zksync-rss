@@ -3,7 +3,6 @@ import fs from "fs";
 import path from "path";
 import { addEventToRSS, updateRSSFeed } from "~/rss/utils";
 import {
-  convertBigIntToString,
   EventsMapping,
   NetworkConfig,
   downloadFromGCS,
@@ -17,6 +16,14 @@ import {
 import dotenv from "dotenv";
 import { monitorEventsInRange } from "~/shared/getEventsFromBatch";
 import { ParsedEvent } from "~/shared/types";
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+type Segment = {
+  from: number;
+  to: number;
+  attempt: number;
+};
 interface ProcessingState {
   lastProcessedBlock: number;
   hasError: boolean;
@@ -26,18 +33,17 @@ interface ProcessingState {
   consecutiveFailures?: number;
   skippedBatches?: number[];
   apiCallCount?: number;
+  failedSegments?: { from: number; to: number; error: string }[];
 }
 
 // Configuration
 dotenv.config({ path: path.resolve(__dirname, "../.env") });
 
 const STATE_FILE_PATH = path.join(__dirname, "../data/processing-state.json");
-const BATCH_SIZE = 100;
-const BATCH_DELAY = 1000;
 const API_CALL_DELAY = 100; // Delay between API calls to prevent rate limiting
-const MAX_BATCH_RETRIES = 3; // Maximum retries per batch
-const MAX_CONSECUTIVE_FAILURES = 5; // Circuit breaker threshold
-const RETRY_DELAY_BASE = 5000; // Base delay for exponential backoff
+const RETRY_DELAY_BASE = 5000; // Base delay for exponential backoff when retrying segments
+const MAX_SEGMENT_ATTEMPTS = 3; // Maximum retries per segment before giving up
+const MIN_SEGMENT_SPAN = 10; // Minimum block span before we stop splitting further
 const LOCK_FILE_PATH = path.join(__dirname, "../data/processing-history.lock");
 const ARCHIVE_THRESHOLD = 1000;
 const MIN_TIME_BETWEEN_ARCHIVES = 10 * 60 * 1000; // 10 minutes
@@ -118,6 +124,100 @@ export async function releaseRSSLock(): Promise<void> {
   });
 }
 
+async function collectEventsWithAdaptiveRange(
+  config: NetworkConfig,
+  startBlock: number,
+  endBlock: number,
+  record: ProcessingRecord
+): Promise<{ events: ParsedEvent[]; apiCalls: number; failedSegments: { from: number; to: number; error: string }[] }> {
+  if (startBlock > endBlock) {
+    return { events: [], apiCalls: 0, failedSegments: [] };
+  }
+
+  const segments: Segment[] = [{ from: startBlock, to: endBlock, attempt: 0 }];
+  const collected: ParsedEvent[] = [];
+  let apiCalls = 0;
+  const failedSegments: { from: number; to: number; error: string }[] = [];
+
+  while (segments.length > 0) {
+    const segment = segments.shift();
+    if (!segment) {
+      break;
+    }
+
+    if (segment.from > segment.to) {
+      continue;
+    }
+
+    try {
+      console.log(`🔍 Fetching ${config.networkName} range ${segment.from}-${segment.to}`);
+      const events = await monitorEventsInRange(
+        segment.from,
+        segment.to,
+        config.provider,
+        config.eventsMapping,
+        config.networkName,
+        config.chainId
+      );
+      apiCalls++;
+      collected.push(...events);
+    } catch (error) {
+      const span = segment.to - segment.from;
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      console.warn(`⚠️ Failed fetching ${config.networkName} range ${segment.from}-${segment.to}: ${errorMessage}`);
+
+      if (span > MIN_SEGMENT_SPAN) {
+        const mid = Math.floor((segment.from + segment.to) / 2);
+
+        if (mid > segment.from && mid < segment.to) {
+          console.log(`➗ Splitting ${config.networkName} range ${segment.from}-${segment.to} at ${mid}`);
+          segments.unshift(
+            { from: segment.from, to: mid, attempt: 0 },
+            { from: mid + 1, to: segment.to, attempt: 0 }
+          );
+          await sleep(API_CALL_DELAY);
+          continue;
+        }
+      }
+
+      if (segment.attempt + 1 <= MAX_SEGMENT_ATTEMPTS) {
+        const delay = RETRY_DELAY_BASE * (segment.attempt + 1);
+        console.log(`⏳ Retrying ${config.networkName} range ${segment.from}-${segment.to} in ${delay}ms (attempt ${segment.attempt + 1}/${MAX_SEGMENT_ATTEMPTS})`);
+        await sleep(delay);
+        segments.unshift({ ...segment, attempt: segment.attempt + 1 });
+        continue;
+      }
+
+      const failure = {
+        from: segment.from,
+        to: segment.to,
+        error: errorMessage
+      };
+      record.errors.push({
+        block: segment.from,
+        timestamp: new Date().toISOString(),
+        error: `Failed to fetch range ${segment.from}-${segment.to}: ${errorMessage}`
+      });
+      failedSegments.push(failure);
+      console.error(`🚫 Giving up on ${config.networkName} range ${segment.from}-${segment.to} after ${segment.attempt + 1} attempts. Will skip for now.`);
+      continue;
+    }
+
+    if (segments.length > 0) {
+      await sleep(API_CALL_DELAY);
+    }
+  }
+
+  collected.sort((a, b) => {
+    if (a.blocknumber !== b.blocknumber) {
+      return a.blocknumber - b.blocknumber;
+    }
+    return a.txhash.localeCompare(b.txhash);
+  });
+
+  return { events: collected, apiCalls, failedSegments };
+}
+
 /**
  * Processes a range of blocks in batches using the new batched log query.
  */
@@ -125,10 +225,11 @@ export async function processBlockRangeForNetwork(
   config: NetworkConfig,
   startBlock: number,
   endBlock: number,
-  batchSize: number = BATCH_SIZE,
-  skipStateUpdate = false
+  skipStateUpdate = false,
+  options: { updateFeed?: boolean } = {}
 ) {
   console.log(`Processing ${config.networkName} blocks ${startBlock} to ${endBlock}`);
+
   const record: ProcessingRecord = {
     network: config.networkName,
     startBlock,
@@ -138,163 +239,92 @@ export async function processBlockRangeForNetwork(
     eventsFound: 0
   };
 
-  let foundEvents = false;
-  const allEvents: ParsedEvent[] = []; // Store all events in memory
-  let consecutiveFailures = 0;
-  let apiCallCount = 0;
-  const batchRetries: Record<number, number> = {}; // Track retries per batch start block
+  try {
+    const { events, apiCalls, failedSegments } = await collectEventsWithAdaptiveRange(config, startBlock, endBlock, record);
+    const foundEvents = events.length > 0;
+    record.eventsFound = events.length;
 
-  // Process blocks in batches rather than one-by-one
-  for (let batchStart = startBlock; batchStart <= endBlock; batchStart += batchSize) {
-    // Circuit breaker: stop if too many consecutive failures
-    if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-      console.error(`Circuit breaker triggered: ${consecutiveFailures} consecutive failures. Stopping processing.`);
-      record.errors.push({
-        block: batchStart,
-        timestamp: new Date().toISOString(),
-        error: `Circuit breaker triggered after ${consecutiveFailures} consecutive failures`
+    if (failedSegments.length > 0) {
+      console.warn(`⚠️ Skipped ${failedSegments.length} segments for ${config.networkName}. See state file for details.`);
+    }
+
+    if (!skipStateUpdate) {
+      updateState(config.networkName, {
+        lastProcessedBlock: endBlock,
+        hasError: failedSegments.length > 0,
+        lastError: failedSegments[0]?.error,
+        consecutiveFailures: failedSegments.length,
+        apiCallCount: apiCalls,
+        failedSegments: failedSegments
       });
-      break;
     }
 
-    const batchEnd = Math.min(batchStart + batchSize - 1, endBlock);
-    const retryCount = batchRetries[batchStart] || 0;
-    
-    // Skip batch if it has exceeded max retries
-    if (retryCount >= MAX_BATCH_RETRIES) {
-      console.warn(`Skipping batch ${batchStart}-${batchEnd} after ${retryCount} failed attempts`);
-      record.errors.push({
-        block: batchStart,
-        timestamp: new Date().toISOString(),
-        error: `Batch skipped after ${retryCount} failed attempts`
-      });
-      continue;
+    if (!skipStateUpdate) {
+      await updateProcessingHistory(record);
     }
 
-    console.log(`Processing ${config.networkName} batch: ${batchStart} to ${batchEnd} (attempt ${retryCount + 1}/${MAX_BATCH_RETRIES})`);
+    console.log(`Completed processing ${config.networkName}: API calls ${apiCalls}, events ${events.length}, errors ${record.errors.length}`);
 
-    try {
-      // Rate limiting: add delay before API calls
-      if (apiCallCount > 0) {
-        await new Promise(resolve => setTimeout(resolve, API_CALL_DELAY));
-      }
-      
-      // Use the new batched query function
-      const events = await monitorEventsInRange(batchStart, batchEnd, config.provider, config.eventsMapping, config.networkName, config.chainId);
-      apiCallCount++; // Track API usage
-      
-      if (events.length > 0) {
-        foundEvents = true;
-        record.eventsFound += events.length;
-        allEvents.push(...events); // Store events in memory
-        console.log(`Found ${events.length} events in batch ${batchStart}-${batchEnd}`);
-      }
-      
-      // Success: reset failure counters
-      consecutiveFailures = 0;
-      batchRetries[batchStart] = 0;
-      
-      // Update state after finishing the batch
-      if (!skipStateUpdate) {
-        updateState(config.networkName, {
-          lastProcessedBlock: batchEnd,
-          hasError: false,
-          lastError: undefined,
-          consecutiveFailures: 0,
-          apiCallCount: apiCallCount
-        });
-      }
-    } catch (error) {
-      consecutiveFailures++;
-      batchRetries[batchStart] = retryCount + 1;
-      
-      console.error(`Error processing ${config.networkName} blocks ${batchStart} to ${batchEnd} (attempt ${retryCount + 1}):`, error);
-      record.errors.push({
-        block: batchStart,
-        timestamp: new Date().toISOString(),
-        error: error instanceof Error ? error.message : String(error)
-      });
-      
-      // Don't update lastProcessedBlock on failure - let it retry or skip
-      if (!skipStateUpdate) {
-        updateState(config.networkName, {
-          hasError: true,
-          lastError: error instanceof Error ? error.message : String(error),
-          retryCount: retryCount + 1,
-          consecutiveFailures: consecutiveFailures,
-          apiCallCount: apiCallCount
-        });
-      }
-      
-      // Exponential backoff for retries. Always rewind batchStart so the next
-      // loop iteration re-evaluates this same batch (either to retry or to skip
-      // if we've hit MAX_BATCH_RETRIES). This avoids silently skipping ranges.
-      if (retryCount < MAX_BATCH_RETRIES - 1) {
-        const delay = RETRY_DELAY_BASE * Math.pow(2, retryCount);
-        console.log(`Waiting ${delay}ms before retry...`);
-        await new Promise(resolve => setTimeout(resolve, delay));
-      }
-      // Rewind to re-check this batch on next iteration (retry or skip branch)
-      batchStart -= batchSize;
-    }
-
-    // Delay between batches if needed
-    if (batchEnd < endBlock && consecutiveFailures === 0) {
-      await new Promise((resolve) => setTimeout(resolve, BATCH_DELAY));
-    }
-  }
-
-  if (!skipStateUpdate) {
-    await updateProcessingHistory(record);
-  }
-  
-  console.log(`Completed processing: API calls made: ${apiCallCount}, Events found: ${record.eventsFound}, Errors: ${record.errors.length}`);
-
-  // If we found events, update RSS feed with locking
-  if (foundEvents && allEvents.length > 0) {
-    try {
+    if (foundEvents && options.updateFeed !== false) {
       await acquireRSSLock();
       console.log("Acquired RSS lock for feed update");
-      
-      // Add all events to RSS feed at once
-      for (const event of allEvents) {
-        addEventToRSS(
-          event.address,
-          event.eventName,
-          event.topics,
-          event.title,
-          event.link,
-          config.networkName,
-          config.chainId,
-          event.blocknumber,
-          config.governanceName,
-          event.proposalLink,
-          event.timestamp,
-          convertBigIntToString(event.args)
-        );
-      }
-      
-      // Update RSS feed once after all events are added
-      const updated = await updateRSSFeed();
-      console.log(updated ? "RSS feed updated" : "RSS feed unchanged");
-      
-      await releaseRSSLock();
-      console.log("Released RSS lock");
-    } catch (error) {
-      console.error("Error updating RSS feed:", error);
       try {
-        if (fs.existsSync(RSS_LOCK_FILE_PATH)) {
-          await releaseRSSLock();
-          console.log("Released RSS lock after error");
+        for (const event of events) {
+          await addEventToRSS(
+            event.address,
+            event.eventName,
+            event.topics,
+            event.title,
+            event.link,
+            config.networkName,
+            config.chainId,
+            event.blocknumber,
+            config.governanceName,
+            event.proposalLink,
+            event.timestamp,
+            event.args
+          );
         }
-      } catch (releaseError) {
-        console.error("Failed to release RSS lock:", releaseError);
-      }
-      throw error;
-    }
-  }
 
-  return foundEvents;
+        const updated = await updateRSSFeed();
+        console.log(updated ? "RSS feed updated" : "RSS feed unchanged");
+      } finally {
+        await releaseRSSLock();
+        console.log("Released RSS lock");
+      }
+    }
+
+    return foundEvents;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`Failed processing ${config.networkName} blocks ${startBlock}-${endBlock}:`, error);
+
+    if (record.errors.length === 0) {
+      record.errors.push({
+        block: startBlock,
+        timestamp: new Date().toISOString(),
+        error: message
+      });
+    }
+
+    if (!skipStateUpdate) {
+      updateState(config.networkName, {
+        hasError: true,
+        lastError: message,
+        consecutiveFailures: (record.errors?.length ?? 0),
+      });
+    }
+
+    if (!skipStateUpdate) {
+      try {
+        await updateProcessingHistory(record);
+      } catch (historyError) {
+        console.error("Failed to update processing history after error:", historyError);
+      }
+    }
+
+    throw error;
+  }
 }
 
 export function updateState(network: string, state: Partial<ProcessingState>) {
@@ -310,9 +340,34 @@ export function updateState(network: string, state: Partial<ProcessingState>) {
   } catch (error) {
     console.warn("Error reading state file, starting fresh:", error);
   }
+
+  const existing = allStates[network];
+  let mergedFailedSegments: { from: number; to: number; error: string }[] | undefined;
+
+  if (state.failedSegments !== undefined) {
+    if (state.failedSegments.length === 0) {
+      mergedFailedSegments = [];
+    } else if (existing?.failedSegments?.length) {
+      const combined = [...existing.failedSegments, ...state.failedSegments];
+      const unique = new Map<string, { from: number; to: number; error: string }>();
+      for (const item of combined) {
+        const key = `${item.from}-${item.to}`;
+        if (!unique.has(key)) {
+          unique.set(key, item);
+        }
+      }
+      mergedFailedSegments = Array.from(unique.values());
+    } else {
+      mergedFailedSegments = [...state.failedSegments];
+    }
+  } else {
+    mergedFailedSegments = existing?.failedSegments;
+  }
+
   allStates[network] = {
-    ...allStates[network],
+    ...existing,
     ...state,
+    failedSegments: mergedFailedSegments,
     lastUpdated: new Date().toISOString()
   };
   fs.writeFileSync(STATE_FILE_PATH, JSON.stringify(allStates, null, 2));
@@ -349,6 +404,11 @@ export async function processLatestBlocks() {
         const fileContent = fs.readFileSync(STATE_FILE_PATH, "utf8");
         console.log("State file content:", fileContent);
         stateData = JSON.parse(fileContent);
+        Object.entries(stateData).forEach(([networkName, state]) => {
+          if (state.failedSegments?.length) {
+            console.warn(`⚠️ Pending failed segments for ${networkName}:`, state.failedSegments);
+          }
+        });
       } catch (error) {
         console.error("Error parsing state file:", error);
       }
@@ -516,8 +576,8 @@ export async function processSpecificBlockRanges(
       config,
       startBlock,
       endBlock,
-      BATCH_SIZE,
-      options.skipStateUpdate
+      options.skipStateUpdate,
+      { updateFeed: options.updateFeed }
     );
     
     return foundEvents;

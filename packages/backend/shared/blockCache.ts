@@ -13,7 +13,7 @@ class BlockTimestampCache {
   private maxAge = 7 * 24 * 60 * 60 * 1000; // 1 week
   private maxEntries = 10000;
 
-  constructor(cacheFileName: string = 'block-timestamps.json') {
+  constructor(cacheFileName = 'block-timestamps.json') {
     this.cacheFile = path.join(__dirname, '../data', cacheFileName);
     this.loadFromDisk();
   }
